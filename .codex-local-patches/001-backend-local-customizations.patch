@@ -1,0 +1,4191 @@
+diff --git a/internal/api/handlers/management/api_tools.go b/internal/api/handlers/management/api_tools.go
+index e125192..c175a33 100644
+--- a/internal/api/handlers/management/api_tools.go
++++ b/internal/api/handlers/management/api_tools.go
+@@ -15,6 +15,7 @@ import (
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+ 	log "github.com/sirupsen/logrus"
++	"github.com/tidwall/gjson"
+ )
+ 
+ const defaultAPICallTimeout = 60 * time.Second
+@@ -195,6 +196,8 @@ func (h *Handler) APICall(c *gin.Context) {
+ 		return
+ 	}
+ 
++	h.markInvalidAuthFromAPICall(c.Request.Context(), auth, resp.StatusCode, respBody)
++
+ 	c.JSON(http.StatusOK, apiCallResponse{
+ 		StatusCode: resp.StatusCode,
+ 		Header:     resp.Header,
+@@ -202,6 +205,66 @@ func (h *Handler) APICall(c *gin.Context) {
+ 	})
+ }
+ 
++func (h *Handler) markInvalidAuthFromAPICall(ctx context.Context, auth *coreauth.Auth, statusCode int, respBody []byte) {
++	if h == nil || h.authManager == nil || auth == nil {
++		return
++	}
++	var status coreauth.Status
++	statusMessage := ""
++	lastError := &coreauth.Error{HTTPStatus: statusCode}
++	switch {
++	case matchesInvalidAuthResponse(statusCode, respBody):
++		status = coreauth.Status(invalidAuthStatus)
++		statusMessage = invalidAuthReason
++		lastError.Code = invalidAuthErrorCode
++		lastError.Message = gjson.GetBytes(respBody, "error.message").String()
++	case matchesTokenInvalidAuthResponse(statusCode, respBody):
++		status = coreauth.Status(tokenInvalidAuthStatus)
++		statusMessage = tokenInvalidAuthReason
++		lastError.Code = tokenInvalidAuthErrorCode
++		lastError.Message = gjson.GetBytes(respBody, "error.message").String()
++	default:
++		return
++	}
++
++	updated := auth.Clone()
++	updated.Status = status
++	updated.StatusMessage = statusMessage
++	updated.LastError = lastError
++	updated.UpdatedAt = time.Now()
++	if _, errUpdate := h.authManager.Update(ctx, updated); errUpdate != nil {
++		log.WithError(errUpdate).Debug("failed to mark invalid auth from management APICall")
++	}
++}
++
++func matchesInvalidAuthResponse(statusCode int, respBody []byte) bool {
++	if statusCode != http.StatusForbidden {
++		return false
++	}
++	code := strings.TrimSpace(gjson.GetBytes(respBody, "error.code").String())
++	if code != invalidAuthErrorCode {
++		return false
++	}
++	message := gjson.GetBytes(respBody, "error.message").String()
++	return strings.Contains(message, invalidAuthMessageSubstring)
++}
++
++func matchesTokenInvalidAuthResponse(statusCode int, respBody []byte) bool {
++	if statusCode != http.StatusUnauthorized {
++		return false
++	}
++	code := strings.TrimSpace(gjson.GetBytes(respBody, "error.code").String())
++	if code != tokenInvalidAuthErrorCode {
++		return false
++	}
++	errorType := strings.TrimSpace(gjson.GetBytes(respBody, "error.type").String())
++	if errorType != tokenInvalidAuthErrorType {
++		return false
++	}
++	message := strings.TrimSpace(gjson.GetBytes(respBody, "error.message").String())
++	return message == tokenInvalidAuthMessage
++}
++
+ func firstNonEmptyString(values ...*string) string {
+ 	for _, v := range values {
+ 		if v == nil {
+diff --git a/internal/api/handlers/management/api_tools_test.go b/internal/api/handlers/management/api_tools_test.go
+index ca1f313..85a23f4 100644
+--- a/internal/api/handlers/management/api_tools_test.go
++++ b/internal/api/handlers/management/api_tools_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net/http"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+@@ -29,6 +30,113 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
+ 	}
+ }
+ 
++func TestMarkInvalidAuthFromAPICallRequiresExactInactiveWorkspaceError(t *testing.T) {
++	manager := coreauth.NewManager(nil, nil, nil)
++	auth := &coreauth.Auth{
++		ID:        "invalid-workspace-auth",
++		Provider:  "antigravity",
++		Status:    coreauth.StatusActive,
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	auth.EnsureIndex()
++	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	h := &Handler{authManager: manager}
++	body := []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"user is not an active member of the selected workspace"}}`)
++	h.markInvalidAuthFromAPICall(context.Background(), auth, http.StatusForbidden, body)
++
++	updated, ok := manager.GetByID(auth.ID)
++	if !ok {
++		t.Fatalf("auth %q missing", auth.ID)
++	}
++	if string(updated.Status) != invalidAuthStatus {
++		t.Fatalf("status = %q, want %q", updated.Status, invalidAuthStatus)
++	}
++	if updated.StatusMessage != invalidAuthReason {
++		t.Fatalf("status_message = %q, want %q", updated.StatusMessage, invalidAuthReason)
++	}
++	if updated.LastError == nil || updated.LastError.Code != invalidAuthErrorCode || updated.LastError.HTTPStatus != http.StatusForbidden {
++		t.Fatalf("last_error = %+v, want invalid auth error", updated.LastError)
++	}
++
++	auth2 := &coreauth.Auth{
++		ID:        "ordinary-403-auth",
++		Provider:  "antigravity",
++		Status:    coreauth.StatusActive,
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	if _, errRegister := manager.Register(context.Background(), auth2); errRegister != nil {
++		t.Fatalf("register auth2: %v", errRegister)
++	}
++	h.markInvalidAuthFromAPICall(context.Background(), auth2, http.StatusForbidden, []byte(`{"error":{"code":"forbidden","message":"access denied"}}`))
++	unchanged, ok := manager.GetByID(auth2.ID)
++	if !ok {
++		t.Fatalf("auth %q missing", auth2.ID)
++	}
++	if unchanged.Status != coreauth.StatusActive || unchanged.StatusMessage != "" {
++		t.Fatalf("ordinary 403 changed auth: status=%q status_message=%q", unchanged.Status, unchanged.StatusMessage)
++	}
++}
++
++func TestMarkInvalidAuthFromAPICallRequiresExactTokenInvalidError(t *testing.T) {
++	manager := coreauth.NewManager(nil, nil, nil)
++	auth := &coreauth.Auth{
++		ID:        "token-invalid-auth",
++		Provider:  "antigravity",
++		Status:    coreauth.StatusActive,
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	auth.EnsureIndex()
++	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	h := &Handler{authManager: manager}
++	body := []byte(`{"error":{"message":"` + tokenInvalidAuthMessage + `","type":"authentication_error","code":"auth_unavailable"}}`)
++	h.markInvalidAuthFromAPICall(context.Background(), auth, http.StatusUnauthorized, body)
++
++	updated, ok := manager.GetByID(auth.ID)
++	if !ok {
++		t.Fatalf("auth %q missing", auth.ID)
++	}
++	if string(updated.Status) != tokenInvalidAuthStatus {
++		t.Fatalf("status = %q, want %q", updated.Status, tokenInvalidAuthStatus)
++	}
++	if updated.StatusMessage != tokenInvalidAuthReason {
++		t.Fatalf("status_message = %q, want %q", updated.StatusMessage, tokenInvalidAuthReason)
++	}
++	if updated.LastError == nil || updated.LastError.Code != tokenInvalidAuthErrorCode || updated.LastError.HTTPStatus != http.StatusUnauthorized {
++		t.Fatalf("last_error = %+v, want token invalid error", updated.LastError)
++	}
++	if updated.LastError.Message != tokenInvalidAuthMessage {
++		t.Fatalf("last_error.message = %q, want %q", updated.LastError.Message, tokenInvalidAuthMessage)
++	}
++
++	auth2 := &coreauth.Auth{
++		ID:        "ordinary-401-auth",
++		Provider:  "antigravity",
++		Status:    coreauth.StatusActive,
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	if _, errRegister := manager.Register(context.Background(), auth2); errRegister != nil {
++		t.Fatalf("register auth2: %v", errRegister)
++	}
++	h.markInvalidAuthFromAPICall(context.Background(), auth2, http.StatusUnauthorized, []byte(`{"error":{"message":"missing token","type":"authentication_error","code":"auth_unavailable"}}`))
++	unchanged, ok := manager.GetByID(auth2.ID)
++	if !ok {
++		t.Fatalf("auth %q missing", auth2.ID)
++	}
++	if unchanged.Status != coreauth.StatusActive || unchanged.StatusMessage != "" {
++		t.Fatalf("ordinary 401 changed auth: status=%q status_message=%q", unchanged.Status, unchanged.StatusMessage)
++	}
++}
++
+ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -76,10 +184,6 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
+ 				APIKey:   "codex-key",
+ 				ProxyURL: "http://codex-proxy.example.com:8080",
+ 			}},
+-			XAIKey: []config.XAIKey{{
+-				APIKey:   "xai-key",
+-				ProxyURL: "http://xai-proxy.example.com:8080",
+-			}},
+ 			OpenAICompatibility: []config.OpenAICompatibility{{
+ 				Name:    "bohe",
+ 				BaseURL: "https://bohe.example.com",
+@@ -120,14 +224,6 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
+ 			},
+ 			wantProxy: "http://codex-proxy.example.com:8080",
+ 		},
+-		{
+-			name: "xai",
+-			auth: &coreauth.Auth{
+-				Provider:   "xai",
+-				Attributes: map[string]string{"api_key": "xai-key"},
+-			},
+-			wantProxy: "http://xai-proxy.example.com:8080",
+-		},
+ 		{
+ 			name: "openai-compatibility",
+ 			auth: &coreauth.Auth{
+diff --git a/internal/api/handlers/management/auth_files.go b/internal/api/handlers/management/auth_files.go
+index 17f2028..cb3e9ce 100644
+--- a/internal/api/handlers/management/auth_files.go
++++ b/internal/api/handlers/management/auth_files.go
+@@ -29,6 +29,7 @@ import (
+ 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+@@ -68,6 +69,18 @@ var (
+ 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
+ )
+ 
++const (
++	invalidAuthStatus           = "无效认证"
++	invalidAuthReason           = "账号不是当前 workspace 成员"
++	invalidAuthErrorCode        = "biscuit_baker_service_auth_credential_error_status"
++	invalidAuthMessageSubstring = "not an active member of the selected workspace"
++	tokenInvalidAuthStatus      = "401认证失效"
++	tokenInvalidAuthReason      = "认证 token 已失效"
++	tokenInvalidAuthErrorCode   = "auth_unavailable"
++	tokenInvalidAuthErrorType   = "authentication_error"
++	tokenInvalidAuthMessage     = "Your authentication token has been invalidated. Please try signing in again."
++)
++
+ func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
+ 	if len(meta) == 0 {
+ 		return time.Time{}, false
+@@ -487,6 +500,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+ 	entry["success"] = auth.Success
+ 	entry["failed"] = auth.Failed
+ 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
++	if usageStats, ok := h.openAIUsageForAuth(auth); ok {
++		entry["openai_usage"] = usageStats
++	}
+ 	if email := authEmail(auth); email != "" {
+ 		entry["email"] = email
+ 	}
+@@ -570,6 +586,69 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+ 	return entry
+ }
+ 
++func (h *Handler) openAIUsageForAuth(auth *coreauth.Auth) (openaiusage.AccountStats, bool) {
++	if auth == nil {
++		return openaiusage.AccountStats{}, false
++	}
++	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
++	if provider != "codex" && provider != "openai" {
++		return openaiusage.AccountStats{}, false
++	}
++	if auth.AuthKind() != coreauth.AuthKindOAuth {
++		return openaiusage.AccountStats{}, false
++	}
++	fileName := openAIUsageAuthFileName(auth)
++	if fileName == "" {
++		return openaiusage.AccountStats{}, false
++	}
++	authIndex := strings.TrimSpace(auth.EnsureIndex())
++	if authIndex == "" {
++		return openaiusage.AccountStats{}, false
++	}
++	store := h.openAIUsageStoreSnapshot()
++	if store == nil {
++		return zeroOpenAIUsageStats(auth, authIndex, fileName), true
++	}
++	if stats, ok := store.Account(authIndex); ok {
++		return stats, true
++	}
++	return zeroOpenAIUsageStats(auth, authIndex, fileName), true
++}
++
++func openAIUsageAuthFileName(auth *coreauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	for _, candidate := range []string{
++		auth.FileName,
++		authAttribute(auth, coreauth.AttributePath),
++		auth.ID,
++	} {
++		candidate = strings.TrimSpace(candidate)
++		if candidate == "" {
++			continue
++		}
++		name := filepath.Base(candidate)
++		if strings.HasSuffix(strings.ToLower(name), ".json") {
++			return name
++		}
++	}
++	return ""
++}
++
++func zeroOpenAIUsageStats(auth *coreauth.Auth, authIndex string, fileName string) openaiusage.AccountStats {
++	if auth == nil {
++		return openaiusage.AccountStats{}
++	}
++	return openaiusage.AccountStats{
++		AuthIndex:            authIndex,
++		AuthFileName:         strings.TrimSpace(fileName),
++		AccountEmail:         authEmail(auth),
++		EstimatedCostNanoUSD: 0,
++		EstimatedCostUSD:     openaiusage.FormatUSD(0),
++	}
++}
++
+ func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {
+ 	if auth == nil {
+ 		return false, false
+@@ -894,6 +973,103 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
+ 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+ }
+ 
++func (h *Handler) RemoveInvalidAuthFiles(c *gin.Context) {
++	h.removeAuthFilesByStatus(c, invalidAuthStatus, "invalid")
++}
++
++func (h *Handler) Remove401InvalidAuthFiles(c *gin.Context) {
++	h.removeAuthFilesByStatus(c, tokenInvalidAuthStatus, "401-invalid")
++}
++
++func (h *Handler) removeAuthFilesByStatus(c *gin.Context, status string, removedSubDir string) {
++	if h.authManager == nil {
++		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
++		return
++	}
++	if h.cfg == nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
++		return
++	}
++
++	resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(h.cfg.AuthDir)
++	if errResolveAuthDir != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve auth dir: %v", errResolveAuthDir)})
++		return
++	}
++	targetDir := filepath.Join(resolvedAuthDir, "removed", removedSubDir)
++
++	loc, errLocation := time.LoadLocation("Asia/Shanghai")
++	if errLocation != nil {
++		loc = time.FixedZone("Asia/Shanghai", 8*60*60)
++	}
++	timestamp := time.Now().In(loc).Format("20060102-150405")
++	if errMkdir := os.MkdirAll(targetDir, 0o700); errMkdir != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create target dir: %v", errMkdir)})
++		return
++	}
++
++	ctx := c.Request.Context()
++	removedFiles := make([]string, 0)
++	movedPaths := make(map[string]struct{})
++
++	for _, auth := range h.authManager.List() {
++		if auth == nil || string(auth.Status) != status {
++			continue
++		}
++		sourcePath := h.sourcePathForInvalidAuth(auth)
++		if sourcePath == "" {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": "auth file path is empty"})
++			return
++		}
++		sourcePath = cleanAuthFilePath(sourcePath)
++		if _, seen := movedPaths[sourcePath]; seen {
++			continue
++		}
++		movedPaths[sourcePath] = struct{}{}
++
++		removedName := filepath.Base(sourcePath) + ".removed-" + timestamp
++		targetPath := filepath.Join(targetDir, removedName)
++		if errMove := moveAuthFile(sourcePath, targetPath); errMove != nil {
++			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to move file: %v", errMove)})
++			return
++		}
++		h.removeAuthsForPath(ctx, sourcePath, strings.TrimSpace(auth.ID))
++		removedFiles = append(removedFiles, removedName)
++	}
++
++	if errLoad := h.authManager.Load(ctx); errLoad != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to reload auth pool: %v", errLoad)})
++		return
++	}
++
++	c.JSON(http.StatusOK, gin.H{
++		"removed":    len(removedFiles),
++		"target_dir": targetDir,
++		"files":      removedFiles,
++	})
++}
++
++func (h *Handler) sourcePathForInvalidAuth(auth *coreauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
++		return path
++	}
++	name := strings.TrimSpace(auth.FileName)
++	if name == "" {
++		name = strings.TrimSpace(auth.ID)
++	}
++	if name == "" || h == nil || h.cfg == nil {
++		return ""
++	}
++	resolvedAuthDir, errResolve := util.ResolveAuthDir(h.cfg.AuthDir)
++	if errResolve != nil {
++		return ""
++	}
++	return filepath.Join(resolvedAuthDir, filepath.Base(name))
++}
++
+ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
+ 	if h == nil || c == nil || c.ContentType() != "multipart/form-data" {
+ 		return nil, nil
+@@ -1856,6 +2032,50 @@ func cleanAuthFilePath(path string) string {
+ 	return filepath.Clean(path)
+ }
+ 
++func moveAuthFile(sourcePath string, targetPath string) error {
++	if strings.TrimSpace(sourcePath) == "" || strings.TrimSpace(targetPath) == "" {
++		return fmt.Errorf("source and target paths are required")
++	}
++	if errRename := os.Rename(sourcePath, targetPath); errRename == nil {
++		return nil
++	}
++
++	input, errOpen := os.Open(sourcePath)
++	if errOpen != nil {
++		return errOpen
++	}
++	defer func() {
++		if errClose := input.Close(); errClose != nil {
++			log.Errorf("source auth file close error: %v", errClose)
++		}
++	}()
++
++	output, errCreate := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
++	if errCreate != nil {
++		return errCreate
++	}
++	copyOK := false
++	defer func() {
++		if errClose := output.Close(); errClose != nil {
++			log.Errorf("target auth file close error: %v", errClose)
++		}
++		if !copyOK {
++			if errRemove := os.Remove(targetPath); errRemove != nil && !os.IsNotExist(errRemove) {
++				log.Errorf("failed to remove partial auth file: %v", errRemove)
++			}
++		}
++	}()
++
++	if _, errCopy := io.Copy(output, input); errCopy != nil {
++		return errCopy
++	}
++	copyOK = true
++	if errRemove := os.Remove(sourcePath); errRemove != nil {
++		return errRemove
++	}
++	return nil
++}
++
+ func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
+ 	if strings.TrimSpace(path) == "" {
+ 		return fmt.Errorf("auth path is empty")
+diff --git a/internal/api/handlers/management/auth_files_delete_test.go b/internal/api/handlers/management/auth_files_delete_test.go
+index 1287ab1..d3e9ad9 100644
+--- a/internal/api/handlers/management/auth_files_delete_test.go
++++ b/internal/api/handlers/management/auth_files_delete_test.go
+@@ -8,7 +8,9 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+@@ -98,6 +100,224 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveInvalidAuthFilesUsesConfiguredAuthDir(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	tempDir := t.TempDir()
++	authDir := filepath.Join(tempDir, "auth")
++	targetDir := filepath.Join(authDir, "removed", "invalid")
++	if errMkdirAuth := os.MkdirAll(authDir, 0o700); errMkdirAuth != nil {
++		t.Fatalf("failed to create auth dir: %v", errMkdirAuth)
++	}
++
++	invalidName := "invalid-user.json"
++	activeName := "active-user.json"
++	invalidPath := filepath.Join(authDir, invalidName)
++	activePath := filepath.Join(authDir, activeName)
++	if errWrite := os.WriteFile(invalidPath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
++		t.Fatalf("failed to write invalid auth file: %v", errWrite)
++	}
++	if errWrite := os.WriteFile(activePath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
++		t.Fatalf("failed to write active auth file: %v", errWrite)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	invalidAuth := &coreauth.Auth{
++		ID:            "invalid-auth",
++		FileName:      invalidName,
++		Provider:      "antigravity",
++		Status:        coreauth.Status(invalidAuthStatus),
++		StatusMessage: invalidAuthReason,
++		Attributes: map[string]string{
++			"path": invalidPath,
++		},
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	activeAuth := &coreauth.Auth{
++		ID:       "active-auth",
++		FileName: activeName,
++		Provider: "antigravity",
++		Status:   coreauth.StatusActive,
++		Attributes: map[string]string{
++			"path": activePath,
++		},
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	if _, errRegister := manager.Register(context.Background(), invalidAuth); errRegister != nil {
++		t.Fatalf("failed to register invalid auth: %v", errRegister)
++	}
++	if _, errRegister := manager.Register(context.Background(), activeAuth); errRegister != nil {
++		t.Fatalf("failed to register active auth: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	rec := httptest.NewRecorder()
++	ctx, _ := gin.CreateTestContext(rec)
++	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/remove-invalid", nil)
++	h.RemoveInvalidAuthFiles(ctx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected remove-invalid status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Removed   int      `json:"removed"`
++		TargetDir string   `json:"target_dir"`
++		Files     []string `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode remove-invalid payload: %v", errUnmarshal)
++	}
++	if payload.Removed != 1 {
++		t.Fatalf("removed = %d, want 1", payload.Removed)
++	}
++	if payload.TargetDir != targetDir {
++		t.Fatalf("target_dir = %q, want %q", payload.TargetDir, targetDir)
++	}
++	if len(payload.Files) != 1 || !strings.HasPrefix(payload.Files[0], invalidName+".removed-") {
++		t.Fatalf("files = %#v, want moved invalid file", payload.Files)
++	}
++	if _, errStat := os.Stat(invalidPath); !os.IsNotExist(errStat) {
++		t.Fatalf("expected invalid auth source file to be moved, stat err: %v", errStat)
++	}
++	if _, errStat := os.Stat(filepath.Join(targetDir, payload.Files[0])); errStat != nil {
++		t.Fatalf("expected moved invalid auth file in target dir: %v", errStat)
++	}
++	if _, errStat := os.Stat(activePath); errStat != nil {
++		t.Fatalf("expected active auth source file to remain: %v", errStat)
++	}
++	if _, ok := manager.GetByID(invalidAuth.ID); ok {
++		t.Fatalf("expected invalid runtime auth to be removed")
++	}
++	if _, ok := manager.GetByID(activeAuth.ID); !ok {
++		t.Fatalf("expected active runtime auth to remain")
++	}
++}
++
++func TestRemove401InvalidAuthFilesUsesConfiguredAuthDir(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	tempDir := t.TempDir()
++	authDir := filepath.Join(tempDir, "auth")
++	targetDir := filepath.Join(authDir, "removed", "401-invalid")
++	if errMkdirAuth := os.MkdirAll(authDir, 0o700); errMkdirAuth != nil {
++		t.Fatalf("failed to create auth dir: %v", errMkdirAuth)
++	}
++
++	tokenInvalidName := "token-invalid-user.json"
++	invalidName := "invalid-workspace-user.json"
++	activeName := "active-user.json"
++	tokenInvalidPath := filepath.Join(authDir, tokenInvalidName)
++	invalidPath := filepath.Join(authDir, invalidName)
++	activePath := filepath.Join(authDir, activeName)
++	if errWrite := os.WriteFile(tokenInvalidPath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
++		t.Fatalf("failed to write token invalid auth file: %v", errWrite)
++	}
++	if errWrite := os.WriteFile(invalidPath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
++		t.Fatalf("failed to write invalid workspace auth file: %v", errWrite)
++	}
++	if errWrite := os.WriteFile(activePath, []byte(`{"type":"antigravity"}`), 0o600); errWrite != nil {
++		t.Fatalf("failed to write active auth file: %v", errWrite)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	tokenInvalidAuth := &coreauth.Auth{
++		ID:            "token-invalid-auth",
++		FileName:      tokenInvalidName,
++		Provider:      "antigravity",
++		Status:        coreauth.Status(tokenInvalidAuthStatus),
++		StatusMessage: tokenInvalidAuthReason,
++		Attributes: map[string]string{
++			"path": tokenInvalidPath,
++		},
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	invalidAuth := &coreauth.Auth{
++		ID:            "invalid-workspace-auth",
++		FileName:      invalidName,
++		Provider:      "antigravity",
++		Status:        coreauth.Status(invalidAuthStatus),
++		StatusMessage: invalidAuthReason,
++		Attributes: map[string]string{
++			"path": invalidPath,
++		},
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	activeAuth := &coreauth.Auth{
++		ID:       "active-auth",
++		FileName: activeName,
++		Provider: "antigravity",
++		Status:   coreauth.StatusActive,
++		Attributes: map[string]string{
++			"path": activePath,
++		},
++		CreatedAt: time.Now(),
++		UpdatedAt: time.Now(),
++	}
++	if _, errRegister := manager.Register(context.Background(), tokenInvalidAuth); errRegister != nil {
++		t.Fatalf("failed to register token invalid auth: %v", errRegister)
++	}
++	if _, errRegister := manager.Register(context.Background(), invalidAuth); errRegister != nil {
++		t.Fatalf("failed to register invalid workspace auth: %v", errRegister)
++	}
++	if _, errRegister := manager.Register(context.Background(), activeAuth); errRegister != nil {
++		t.Fatalf("failed to register active auth: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	rec := httptest.NewRecorder()
++	ctx, _ := gin.CreateTestContext(rec)
++	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/remove-401-invalid", nil)
++	h.Remove401InvalidAuthFiles(ctx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected remove-401-invalid status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Removed   int      `json:"removed"`
++		TargetDir string   `json:"target_dir"`
++		Files     []string `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode remove-401-invalid payload: %v", errUnmarshal)
++	}
++	if payload.Removed != 1 {
++		t.Fatalf("removed = %d, want 1", payload.Removed)
++	}
++	if payload.TargetDir != targetDir {
++		t.Fatalf("target_dir = %q, want %q", payload.TargetDir, targetDir)
++	}
++	if len(payload.Files) != 1 || !strings.HasPrefix(payload.Files[0], tokenInvalidName+".removed-") {
++		t.Fatalf("files = %#v, want moved token invalid file", payload.Files)
++	}
++	if _, errStat := os.Stat(tokenInvalidPath); !os.IsNotExist(errStat) {
++		t.Fatalf("expected token invalid auth source file to be moved, stat err: %v", errStat)
++	}
++	if _, errStat := os.Stat(filepath.Join(targetDir, payload.Files[0])); errStat != nil {
++		t.Fatalf("expected moved token invalid auth file in target dir: %v", errStat)
++	}
++	if _, errStat := os.Stat(invalidPath); errStat != nil {
++		t.Fatalf("expected invalid workspace auth source file to remain: %v", errStat)
++	}
++	if _, errStat := os.Stat(activePath); errStat != nil {
++		t.Fatalf("expected active auth source file to remain: %v", errStat)
++	}
++	if _, ok := manager.GetByID(tokenInvalidAuth.ID); ok {
++		t.Fatalf("expected token invalid runtime auth to be removed")
++	}
++	if _, ok := manager.GetByID(invalidAuth.ID); !ok {
++		t.Fatalf("expected invalid workspace runtime auth to remain")
++	}
++	if _, ok := manager.GetByID(activeAuth.ID); !ok {
++		t.Fatalf("expected active runtime auth to remain")
++	}
++}
++
+ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
+ 	t.Setenv("MANAGEMENT_PASSWORD", "")
+ 
+diff --git a/internal/api/handlers/management/auth_files_openai_usage_test.go b/internal/api/handlers/management/auth_files_openai_usage_test.go
+new file mode 100644
+index 0000000..2c39ff3
+--- /dev/null
++++ b/internal/api/handlers/management/auth_files_openai_usage_test.go
+@@ -0,0 +1,257 @@
++package management
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++)
++
++func TestListAuthFilesIncludesZeroOpenAIUsageForOAuthJSONWithoutHistory(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	authDir := t.TempDir()
++	authPath := filepath.Join(authDir, "codex-user.json")
++	if err := os.WriteFile(authPath, []byte(`{"email":"user@example.com"}`), 0o600); err != nil {
++		t.Fatalf("failed to write auth file: %v", err)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	record := &coreauth.Auth{
++		ID:       "codex-oauth-json",
++		Provider: "codex",
++		FileName: "codex-user.json",
++		Attributes: map[string]string{
++			coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
++			coreauth.AttributePath:     authPath,
++			"email":                    "user@example.com",
++		},
++	}
++	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
++		t.Fatalf("failed to register auth record: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	h.tokenStore = &memoryAuthStore{}
++	h.openAIUsageStore = fakeOpenAIUsageStore{}
++
++	rec := httptest.NewRecorder()
++	ginCtx, _ := gin.CreateTestContext(rec)
++	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
++
++	h.ListAuthFiles(ginCtx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Files []map[string]any `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode list payload: %v", errUnmarshal)
++	}
++	if len(payload.Files) != 1 {
++		t.Fatalf("files = %d, want 1", len(payload.Files))
++	}
++
++	usageRaw, ok := payload.Files[0]["openai_usage"].(map[string]any)
++	if !ok {
++		t.Fatalf("openai_usage missing or invalid: %#v", payload.Files[0]["openai_usage"])
++	}
++	if usageRaw["auth_index"] == "" {
++		t.Fatalf("auth_index missing in openai_usage: %#v", usageRaw)
++	}
++	if usageRaw["auth_file_name"] != "codex-user.json" {
++		t.Fatalf("auth_file_name = %#v, want codex-user.json", usageRaw["auth_file_name"])
++	}
++	if usageRaw["account_email"] != "user@example.com" {
++		t.Fatalf("account_email = %#v, want user@example.com", usageRaw["account_email"])
++	}
++	if usageRaw["request_count"] != float64(0) || usageRaw["estimated_cost_nano_usd"] != float64(0) {
++		t.Fatalf("usage counters are not zero: %#v", usageRaw)
++	}
++	if usageRaw["estimated_cost_usd"] != openaiusage.FormatUSD(0) {
++		t.Fatalf("estimated_cost_usd = %#v, want %q", usageRaw["estimated_cost_usd"], openaiusage.FormatUSD(0))
++	}
++}
++
++func TestListAuthFilesIncludesZeroOpenAIUsageWhenRuntimeFileNameIsEmpty(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	authDir := t.TempDir()
++	authPath := filepath.Join(authDir, "codex-empty-filename.json")
++	if err := os.WriteFile(authPath, []byte(`{"email":"user@example.com"}`), 0o600); err != nil {
++		t.Fatalf("failed to write auth file: %v", err)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	record := &coreauth.Auth{
++		ID:       "codex-empty-filename.json",
++		Provider: "codex",
++		Attributes: map[string]string{
++			coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
++			coreauth.AttributePath:     authPath,
++			"email":                    "user@example.com",
++		},
++	}
++	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
++		t.Fatalf("failed to register auth record: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	h.tokenStore = &memoryAuthStore{}
++	h.openAIUsageStore = fakeOpenAIUsageStore{}
++
++	rec := httptest.NewRecorder()
++	ginCtx, _ := gin.CreateTestContext(rec)
++	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
++
++	h.ListAuthFiles(ginCtx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Files []map[string]any `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode list payload: %v", errUnmarshal)
++	}
++	if len(payload.Files) != 1 {
++		t.Fatalf("files = %d, want 1", len(payload.Files))
++	}
++
++	usageRaw, ok := payload.Files[0]["openai_usage"].(map[string]any)
++	if !ok {
++		t.Fatalf("openai_usage missing or invalid: %#v", payload.Files[0]["openai_usage"])
++	}
++	if usageRaw["auth_file_name"] != "codex-empty-filename.json" {
++		t.Fatalf("auth_file_name = %#v, want codex-empty-filename.json", usageRaw["auth_file_name"])
++	}
++}
++
++func TestListAuthFilesIncludesZeroOpenAIUsageForOAuthMetadataWithoutExplicitKind(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	authDir := t.TempDir()
++	authPath := filepath.Join(authDir, "codex-oauth-metadata.json")
++	if err := os.WriteFile(authPath, []byte(`{"access_token":"token","email":"user@example.com"}`), 0o600); err != nil {
++		t.Fatalf("failed to write auth file: %v", err)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	record := &coreauth.Auth{
++		ID:       "codex-oauth-metadata",
++		Provider: "codex",
++		FileName: "codex-oauth-metadata.json",
++		Attributes: map[string]string{
++			coreauth.AttributePath: authPath,
++		},
++		Metadata: map[string]any{
++			"access_token": "token",
++			"email":        "user@example.com",
++		},
++	}
++	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
++		t.Fatalf("failed to register auth record: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	h.tokenStore = &memoryAuthStore{}
++	h.openAIUsageStore = fakeOpenAIUsageStore{}
++
++	rec := httptest.NewRecorder()
++	ginCtx, _ := gin.CreateTestContext(rec)
++	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
++
++	h.ListAuthFiles(ginCtx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Files []map[string]any `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode list payload: %v", errUnmarshal)
++	}
++	if len(payload.Files) != 1 {
++		t.Fatalf("files = %d, want 1", len(payload.Files))
++	}
++
++	usageRaw, ok := payload.Files[0]["openai_usage"].(map[string]any)
++	if !ok {
++		t.Fatalf("openai_usage missing or invalid: %#v", payload.Files[0]["openai_usage"])
++	}
++	if usageRaw["request_count"] != float64(0) {
++		t.Fatalf("request_count = %#v, want 0", usageRaw["request_count"])
++	}
++	if usageRaw["estimated_cost_usd"] != openaiusage.FormatUSD(0) {
++		t.Fatalf("estimated_cost_usd = %#v, want %q", usageRaw["estimated_cost_usd"], openaiusage.FormatUSD(0))
++	}
++}
++
++func TestListAuthFilesDoesNotIncludeOpenAIUsageForAPIKeyJSON(t *testing.T) {
++	t.Setenv("MANAGEMENT_PASSWORD", "")
++
++	authDir := t.TempDir()
++	authPath := filepath.Join(authDir, "codex-api-key.json")
++	if err := os.WriteFile(authPath, []byte(`{"api_key":"test-key"}`), 0o600); err != nil {
++		t.Fatalf("failed to write auth file: %v", err)
++	}
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	record := &coreauth.Auth{
++		ID:       "codex-api-key",
++		Provider: "codex",
++		FileName: "codex-api-key.json",
++		Attributes: map[string]string{
++			coreauth.AttributeAPIKey: "test-key",
++			coreauth.AttributePath:   authPath,
++		},
++	}
++	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
++		t.Fatalf("failed to register auth record: %v", errRegister)
++	}
++
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	h.tokenStore = &memoryAuthStore{}
++	h.openAIUsageStore = fakeOpenAIUsageStore{}
++
++	rec := httptest.NewRecorder()
++	ginCtx, _ := gin.CreateTestContext(rec)
++	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
++
++	h.ListAuthFiles(ginCtx)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
++	}
++
++	var payload struct {
++		Files []map[string]any `json:"files"`
++	}
++	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
++		t.Fatalf("failed to decode list payload: %v", errUnmarshal)
++	}
++	if len(payload.Files) != 1 {
++		t.Fatalf("files = %d, want 1", len(payload.Files))
++	}
++	if _, ok := payload.Files[0]["openai_usage"]; ok {
++		t.Fatalf("openai_usage present for API key auth: %#v", payload.Files[0]["openai_usage"])
++	}
++	if payload.Files[0]["account_type"] != "api_key" {
++		t.Fatalf("account_type = %#v, want api_key", payload.Files[0]["account_type"])
++	}
++}
+diff --git a/internal/api/handlers/management/handler.go b/internal/api/handlers/management/handler.go
+index 78fd505..6017cd2 100644
+--- a/internal/api/handlers/management/handler.go
++++ b/internal/api/handlers/management/handler.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
+ 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+@@ -60,6 +61,7 @@ type Handler struct {
+ 	pluginStoreHTTPClient   pluginstore.HTTPDoer
+ 	pluginReleaseCacheMu    sync.Mutex
+ 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
++	openAIUsageStore        openaiusage.Store
+ }
+ 
+ type configReloadSnapshot struct {
+@@ -150,6 +152,15 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
+ 	h.mu.Unlock()
+ }
+ 
++func (h *Handler) SetOpenAIUsageStore(store openaiusage.Store) {
++	if h == nil {
++		return
++	}
++	h.mu.Lock()
++	h.openAIUsageStore = store
++	h.mu.Unlock()
++}
++
+ // SetConfigReloadHook updates the callback used after management saves config changes.
+ func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
+ 	if h == nil {
+diff --git a/internal/api/handlers/management/openai_usage.go b/internal/api/handlers/management/openai_usage.go
+new file mode 100644
+index 0000000..f08b2ca
+--- /dev/null
++++ b/internal/api/handlers/management/openai_usage.go
+@@ -0,0 +1,64 @@
++package management
++
++import (
++	"net/http"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
++)
++
++func (h *Handler) GetOpenAIUsageStatus(c *gin.Context) {
++	store := h.openAIUsageStoreSnapshot()
++	if store == nil {
++		c.JSON(http.StatusOK, openaiusage.StatusResponse{
++			Enabled:        false,
++			QueueLimit:     openaiusage.QueueLimit,
++			BatchSize:      openaiusage.MaxBatchSize,
++			PricingSource:  "OpenAI API pricing page https://developers.openai.com/api/docs/pricing checked 2026-07-14",
++			PricingVersion: openaiusage.PricingVersion,
++		})
++		return
++	}
++	c.JSON(http.StatusOK, store.Status())
++}
++
++func (h *Handler) GetOpenAIUsageAccounts(c *gin.Context) {
++	store := h.openAIUsageStoreSnapshot()
++	if store == nil {
++		c.JSON(http.StatusOK, openaiusage.AccountsResponse{Accounts: []openaiusage.AccountStats{}})
++		return
++	}
++	accounts := store.Accounts()
++	status := store.Status()
++	c.JSON(http.StatusOK, openaiusage.AccountsResponse{
++		Accounts:            accounts,
++		Total:               len(accounts),
++		DroppedEvents:       status.DroppedEvents,
++		PricingMissingCount: status.PricingMissingCount,
++	})
++}
++
++func (h *Handler) GetOpenAIUsageAccount(c *gin.Context) {
++	store := h.openAIUsageStoreSnapshot()
++	if store == nil {
++		c.JSON(http.StatusNotFound, gin.H{"error": "openai usage not available"})
++		return
++	}
++	authIndex := strings.TrimSpace(c.Param("auth_index"))
++	account, ok := store.Account(authIndex)
++	if !ok {
++		c.JSON(http.StatusNotFound, gin.H{"error": "openai usage account not found"})
++		return
++	}
++	c.JSON(http.StatusOK, account)
++}
++
++func (h *Handler) openAIUsageStoreSnapshot() openaiusage.Store {
++	if h == nil {
++		return nil
++	}
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.openAIUsageStore
++}
+diff --git a/internal/api/handlers/management/openai_usage_test.go b/internal/api/handlers/management/openai_usage_test.go
+new file mode 100644
+index 0000000..17a6d9a
+--- /dev/null
++++ b/internal/api/handlers/management/openai_usage_test.go
+@@ -0,0 +1,103 @@
++package management
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
++)
++
++type fakeOpenAIUsageStore struct {
++	status   openaiusage.StatusResponse
++	accounts []openaiusage.AccountStats
++}
++
++func (s fakeOpenAIUsageStore) Status() openaiusage.StatusResponse { return s.status }
++
++func (s fakeOpenAIUsageStore) Accounts() []openaiusage.AccountStats {
++	return append([]openaiusage.AccountStats(nil), s.accounts...)
++}
++
++func (s fakeOpenAIUsageStore) Account(authIndex string) (openaiusage.AccountStats, bool) {
++	for _, account := range s.accounts {
++		if account.AuthIndex == authIndex {
++			return account, true
++		}
++	}
++	return openaiusage.AccountStats{}, false
++}
++
++func TestGetOpenAIUsageStatus(t *testing.T) {
++	h := &Handler{openAIUsageStore: fakeOpenAIUsageStore{
++		status: openaiusage.StatusResponse{Enabled: true, Path: `E:\CLIProxyAPI\data\openai-usage.json`, QueueLimit: openaiusage.QueueLimit, PricingMissingCount: 4},
++	}}
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/openai-usage/status", nil)
++	h.GetOpenAIUsageStatus(c)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
++	}
++	var payload openaiusage.StatusResponse
++	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	if !payload.Enabled || payload.QueueLimit != openaiusage.QueueLimit || payload.PricingMissingCount != 4 {
++		t.Fatalf("payload = %+v", payload)
++	}
++}
++
++func TestGetOpenAIUsageAccounts(t *testing.T) {
++	h := &Handler{openAIUsageStore: fakeOpenAIUsageStore{
++		status: openaiusage.StatusResponse{DroppedEvents: 2, PricingMissingCount: 5},
++		accounts: []openaiusage.AccountStats{{
++			AuthIndex:           "idx",
++			AuthFileName:        "idx.json",
++			RequestCount:        3,
++			PricingMissingCount: 5,
++		}},
++	}}
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/openai-usage/accounts", nil)
++	h.GetOpenAIUsageAccounts(c)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
++	}
++	var payload openaiusage.AccountsResponse
++	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	if payload.Total != 1 || payload.DroppedEvents != 2 || payload.PricingMissingCount != 5 || payload.Accounts[0].AuthIndex != "idx" || payload.Accounts[0].PricingMissingCount != 5 {
++		t.Fatalf("payload = %+v", payload)
++	}
++}
++
++func TestGetOpenAIUsageAccount(t *testing.T) {
++	h := &Handler{openAIUsageStore: fakeOpenAIUsageStore{
++		accounts: []openaiusage.AccountStats{{AuthIndex: "idx", AuthFileName: "idx.json"}},
++	}}
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Params = gin.Params{{Key: "auth_index", Value: "idx"}}
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/openai-usage/accounts/idx", nil)
++	h.GetOpenAIUsageAccount(c)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
++	}
++}
++
++func TestGetOpenAIUsageAccountNotFound(t *testing.T) {
++	h := &Handler{openAIUsageStore: fakeOpenAIUsageStore{}}
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Params = gin.Params{{Key: "auth_index", Value: "missing"}}
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/openai-usage/accounts/missing", nil)
++	h.GetOpenAIUsageAccount(c)
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
++	}
++}
+diff --git a/internal/api/server.go b/internal/api/server.go
+index 7365068..f6858ac 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -32,6 +32,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+@@ -84,6 +85,7 @@ type serverOptionConfig struct {
+ 	postAuthPersistHook   auth.PostAuthHook
+ 	pluginHost            *pluginhost.Host
+ 	configReloadHook      func(context.Context, *config.Config)
++	openAIUsageStore      openaiusage.Store
+ 	exampleAPIKeySafeMode bool
+ }
+ 
+@@ -184,6 +186,12 @@ func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOpti
+ 	}
+ }
+ 
++func WithOpenAIUsageStore(store openaiusage.Store) ServerOption {
++	return func(cfg *serverOptionConfig) {
++		cfg.openAIUsageStore = store
++	}
++}
++
+ // WithExampleAPIKeySafeMode blocks proxy API endpoints while template API keys remain configured.
+ func WithExampleAPIKeySafeMode() ServerOption {
+ 	return func(cfg *serverOptionConfig) {
+@@ -241,6 +249,8 @@ type Server struct {
+ 	// pluginHost owns dynamic plugin Management API route dispatch.
+ 	pluginHost *pluginhost.Host
+ 
++	openAIUsageStore openaiusage.Store
++
+ 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
+ 	managementRoutesRegistered atomic.Bool
+ 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
+@@ -335,6 +345,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
+ 		envManagementSecret: envManagementSecret,
+ 		wsRoutes:            make(map[string]struct{}),
+ 		pluginHost:          optionState.pluginHost,
++		openAIUsageStore:    optionState.openAIUsageStore,
+ 
+ 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
+ 	}
+@@ -358,6 +369,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
+ 	// Initialize management handler
+ 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+ 	s.mgmt.SetPluginHost(optionState.pluginHost)
++	s.mgmt.SetOpenAIUsageStore(optionState.openAIUsageStore)
+ 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
+ 	if optionState.localPassword != "" {
+ 		s.mgmt.SetLocalPassword(optionState.localPassword)
+@@ -842,6 +854,9 @@ func (s *Server) registerManagementRoutes() {
+ 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
+ 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+ 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
++		mgmt.GET("/openai-usage/status", s.mgmt.GetOpenAIUsageStatus)
++		mgmt.GET("/openai-usage/accounts", s.mgmt.GetOpenAIUsageAccounts)
++		mgmt.GET("/openai-usage/accounts/:auth_index", s.mgmt.GetOpenAIUsageAccount)
+ 
+ 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
+ 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
+@@ -944,6 +959,8 @@ func (s *Server) registerManagementRoutes() {
+ 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
+ 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
+ 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
++		mgmt.POST("/auth-files/remove-invalid", s.mgmt.RemoveInvalidAuthFiles)
++		mgmt.POST("/auth-files/remove-401-invalid", s.mgmt.Remove401InvalidAuthFiles)
+ 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
+ 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+ 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
+@@ -995,6 +1012,17 @@ func (s *Server) RefreshPluginManagementRoutes() {
+ 	s.refreshPluginManagementRoutes()
+ }
+ 
++func (s *Server) SetOpenAIUsageStore(store openaiusage.Store) {
++	if s == nil {
++		return
++	}
++	s.openAIUsageStore = store
++	if s.mgmt == nil {
++		return
++	}
++	s.mgmt.SetOpenAIUsageStore(store)
++}
++
+ func (s *Server) registeredManagementRouteKeys() map[string]struct{} {
+ 	out := make(map[string]struct{})
+ 	if s == nil || s.engine == nil {
+diff --git a/internal/openaiusage/store.go b/internal/openaiusage/store.go
+new file mode 100644
+index 0000000..6c03f9b
+--- /dev/null
++++ b/internal/openaiusage/store.go
+@@ -0,0 +1,713 @@
++package openaiusage
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"math/big"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
++	log "github.com/sirupsen/logrus"
++)
++
++const (
++	PluginName     = "openai-oauth-json-usage"
++	QueueLimit     = 4096
++	MaxBatchSize   = 100
++	fileVersion    = 1
++	defaultDBFile  = "openai-usage.json"
++	pricingSource  = "OpenAI API pricing page https://developers.openai.com/api/docs/pricing checked 2026-07-14"
++	PricingVersion = "openai-official-pricing-2026-07-14"
++)
++
++var retryDelays = []time.Duration{
++	100 * time.Millisecond,
++	500 * time.Millisecond,
++	time.Second,
++	2 * time.Second,
++	5 * time.Second,
++}
++
++// Store exposes the read-only management operations for OpenAI OAuth JSON usage.
++type Store interface {
++	Status() StatusResponse
++	Accounts() []AccountStats
++	Account(authIndex string) (AccountStats, bool)
++}
++
++// StatusResponse is returned by /v0/management/openai-usage/status.
++type StatusResponse struct {
++	Enabled             bool   `json:"enabled"`
++	Path                string `json:"path"`
++	QueueLimit          int    `json:"queue_limit"`
++	BatchSize           int    `json:"batch_size"`
++	DroppedEvents       uint64 `json:"dropped_events"`
++	PricingMissingCount int64  `json:"pricing_missing_count"`
++	PricingSource       string `json:"pricing_source"`
++	PricingVersion      string `json:"pricing_version"`
++	UpdatedAt           string `json:"updated_at,omitempty"`
++}
++
++// AccountsResponse is returned by /v0/management/openai-usage/accounts.
++type AccountsResponse struct {
++	Accounts            []AccountStats `json:"accounts"`
++	Total               int            `json:"total"`
++	DroppedEvents       uint64         `json:"dropped_events"`
++	PricingMissingCount int64          `json:"pricing_missing_count"`
++}
++
++// AccountStats is the fixed public account/file aggregate.
++type AccountStats struct {
++	AuthIndex              string `json:"auth_index"`
++	AuthFileName           string `json:"auth_file_name"`
++	AccountEmail           string `json:"account_email"`
++	RequestCount           int64  `json:"request_count"`
++	InputTokens            int64  `json:"input_tokens"`
++	CachedInputTokens      int64  `json:"cached_input_tokens"`
++	OutputTokens           int64  `json:"output_tokens"`
++	ReasoningTokens        int64  `json:"reasoning_tokens"`
++	TotalTokens            int64  `json:"total_tokens"`
++	UsageMissingCount      int64  `json:"usage_missing_count"`
++	PricingMissingCount    int64  `json:"pricing_missing_count"`
++	EstimatedCostNanoUSD   int64  `json:"estimated_cost_nano_usd"`
++	EstimatedCostUSD       string `json:"estimated_cost_usd"`
++	LastRequestedAt        string `json:"last_requested_at,omitempty"`
++	lastRequestedAtTimeUTC time.Time
++}
++
++type fileData struct {
++	Version        int                     `json:"version"`
++	PricingSource  string                  `json:"pricing_source"`
++	PricingVersion string                  `json:"pricing_version"`
++	UpdatedAt      string                  `json:"updated_at,omitempty"`
++	DroppedEvents  uint64                  `json:"dropped_events"`
++	Accounts       map[string]AccountStats `json:"accounts"`
++}
++
++type Event struct {
++	AuthIndex           string
++	AuthFileName        string
++	AccountEmail        string
++	Model               string
++	ServiceTier         string
++	ResponseServiceTier string
++	RequestedAt         time.Time
++	UsageReported       bool
++	TotalTokensReported bool
++	InputTokens         int64
++	CachedInputTokens   int64
++	CacheCreationTokens int64
++	OutputTokens        int64
++	ReasoningTokens     int64
++	TotalTokens         int64
++}
++
++// PersistentUsagePlugin records only OpenAI/Codex OAuth JSON usage into a JSON file.
++type PersistentUsagePlugin struct {
++	path   string
++	events chan Event
++	done   chan struct{}
++	once   sync.Once
++	cancel context.CancelFunc
++
++	mu            sync.RWMutex
++	accounts      map[string]AccountStats
++	updatedAt     time.Time
++	droppedEvents atomic.Uint64
++
++	saveMu sync.Mutex
++	saveFn func(context.Context) error
++}
++
++// ResolvePath returns the fixed local data file path relative to the config file directory.
++func ResolvePath(configPath string) string {
++	baseDir := strings.TrimSpace(filepath.Dir(configPath))
++	if configPath == "" || baseDir == "." {
++		if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
++			baseDir = wd
++		}
++	}
++	return filepath.Join(baseDir, "data", defaultDBFile)
++}
++
++// NewPersistentUsagePlugin creates and starts the JSON persistence worker.
++func NewPersistentUsagePlugin(path string) *PersistentUsagePlugin {
++	path = strings.TrimSpace(path)
++	if path == "" {
++		path = ResolvePath("")
++	}
++	workerCtx, cancel := context.WithCancel(context.Background())
++	p := &PersistentUsagePlugin{
++		path:     path,
++		events:   make(chan Event, QueueLimit),
++		done:     make(chan struct{}),
++		cancel:   cancel,
++		accounts: make(map[string]AccountStats),
++	}
++	p.saveFn = p.saveLocked
++	p.load()
++	go p.run(workerCtx)
++	return p
++}
++
++func (p *PersistentUsagePlugin) Status() StatusResponse {
++	if p == nil {
++		return StatusResponse{Enabled: false}
++	}
++	p.mu.RLock()
++	updatedAt := formatTime(p.updatedAt)
++	pricingMissingCount := p.pricingMissingCountLocked()
++	p.mu.RUnlock()
++	return StatusResponse{
++		Enabled:             true,
++		Path:                p.path,
++		QueueLimit:          QueueLimit,
++		BatchSize:           MaxBatchSize,
++		DroppedEvents:       p.droppedEvents.Load(),
++		PricingMissingCount: pricingMissingCount,
++		PricingSource:       pricingSource,
++		PricingVersion:      PricingVersion,
++		UpdatedAt:           updatedAt,
++	}
++}
++
++func (p *PersistentUsagePlugin) Accounts() []AccountStats {
++	if p == nil {
++		return nil
++	}
++	p.mu.RLock()
++	out := make([]AccountStats, 0, len(p.accounts))
++	for _, account := range p.accounts {
++		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
++		out = append(out, account)
++	}
++	p.mu.RUnlock()
++	sort.Slice(out, func(i, j int) bool {
++		left := out[i].lastRequestedAtTimeUTC
++		right := out[j].lastRequestedAtTimeUTC
++		if !left.Equal(right) {
++			return left.After(right)
++		}
++		return strings.ToLower(out[i].AuthFileName) < strings.ToLower(out[j].AuthFileName)
++	})
++	return out
++}
++
++func (p *PersistentUsagePlugin) Account(authIndex string) (AccountStats, bool) {
++	authIndex = strings.TrimSpace(authIndex)
++	if p == nil || authIndex == "" {
++		return AccountStats{}, false
++	}
++	p.mu.RLock()
++	account, ok := p.accounts[authIndex]
++	p.mu.RUnlock()
++	if ok {
++		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
++	}
++	return account, ok
++}
++
++func (p *PersistentUsagePlugin) HandleUsage(_ context.Context, record coreusage.Record) {
++	event, ok := EventFromRecord(record)
++	if !ok || p == nil {
++		return
++	}
++	select {
++	case p.events <- event:
++	default:
++		dropped := p.droppedEvents.Add(1)
++		log.WithField("dropped_events", dropped).Warn("openai usage: queue full, dropped usage event")
++	}
++}
++
++func (p *PersistentUsagePlugin) Close(ctx context.Context) error {
++	if p == nil {
++		return nil
++	}
++	p.once.Do(func() {
++		close(p.events)
++	})
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	select {
++	case <-p.done:
++		return nil
++	case <-ctx.Done():
++		if p.cancel != nil {
++			p.cancel()
++		}
++		<-p.done
++		return ctx.Err()
++	}
++}
++
++func (p *PersistentUsagePlugin) run(ctx context.Context) {
++	defer close(p.done)
++	var batch []Event
++	timer := time.NewTimer(time.Hour)
++	if !timer.Stop() {
++		<-timer.C
++	}
++	for {
++		if len(batch) == 0 {
++			select {
++			case <-ctx.Done():
++				return
++			case event, ok := <-p.events:
++				if !ok {
++					return
++				}
++				batch = append(batch, event)
++				timer.Reset(500 * time.Millisecond)
++			}
++		}
++		select {
++		case <-ctx.Done():
++			if !timer.Stop() {
++				select {
++				case <-timer.C:
++				default:
++				}
++			}
++			return
++		case event, ok := <-p.events:
++			if !ok {
++				if !timer.Stop() {
++					select {
++					case <-timer.C:
++					default:
++					}
++				}
++				p.flushWithRetry(ctx, batch)
++				return
++			}
++			batch = append(batch, event)
++			if len(batch) >= MaxBatchSize {
++				if !timer.Stop() {
++					select {
++					case <-timer.C:
++					default:
++					}
++				}
++				p.flushWithRetry(ctx, batch)
++				batch = nil
++			}
++		case <-timer.C:
++			p.flushWithRetry(ctx, batch)
++			batch = nil
++		}
++	}
++}
++
++func (p *PersistentUsagePlugin) flushWithRetry(ctx context.Context, batch []Event) {
++	if p == nil || len(batch) == 0 {
++		return
++	}
++	p.apply(batch)
++	attempt := 0
++	for {
++		if err := p.save(ctx); err != nil {
++			delay := retryDelay(attempt)
++			attempt++
++			log.WithError(err).Warnf("openai usage: persist failed, retrying in %s", delay)
++			timer := time.NewTimer(delay)
++			select {
++			case <-timer.C:
++				continue
++			case <-ctx.Done():
++				timer.Stop()
++				return
++			}
++		}
++		return
++	}
++}
++
++func retryDelay(attempt int) time.Duration {
++	if attempt < 0 {
++		attempt = 0
++	}
++	if attempt >= len(retryDelays) {
++		return retryDelays[len(retryDelays)-1]
++	}
++	return retryDelays[attempt]
++}
++
++func (p *PersistentUsagePlugin) apply(batch []Event) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	now := time.Now().UTC()
++	for _, event := range batch {
++		account := p.accounts[event.AuthIndex]
++		account.AuthIndex = event.AuthIndex
++		if strings.TrimSpace(event.AuthFileName) != "" {
++			account.AuthFileName = event.AuthFileName
++		}
++		if strings.TrimSpace(event.AccountEmail) != "" {
++			account.AccountEmail = event.AccountEmail
++		}
++		account.RequestCount++
++		requestedAt := event.RequestedAt.UTC()
++		if requestedAt.IsZero() {
++			requestedAt = now
++		}
++		if account.lastRequestedAtTimeUTC.IsZero() || requestedAt.After(account.lastRequestedAtTimeUTC) {
++			account.lastRequestedAtTimeUTC = requestedAt
++			account.LastRequestedAt = requestedAt.Format(time.RFC3339)
++		}
++		if !event.UsageReported {
++			account.UsageMissingCount++
++			p.accounts[event.AuthIndex] = account
++			continue
++		}
++		account.InputTokens += event.InputTokens
++		account.CachedInputTokens += event.CachedInputTokens
++		account.OutputTokens += event.OutputTokens
++		account.ReasoningTokens += event.ReasoningTokens
++		account.TotalTokens += normalizedTotal(event)
++		if cost, ok := Price(event); ok {
++			account.EstimatedCostNanoUSD += cost
++		} else {
++			account.PricingMissingCount++
++		}
++		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
++		p.accounts[event.AuthIndex] = account
++	}
++	p.updatedAt = now
++}
++
++func normalizedTotal(event Event) int64 {
++	if event.TotalTokensReported {
++		return event.TotalTokens
++	}
++	return event.InputTokens + event.OutputTokens
++}
++
++func (p *PersistentUsagePlugin) save(ctx context.Context) error {
++	if p == nil {
++		return nil
++	}
++	p.saveMu.Lock()
++	defer p.saveMu.Unlock()
++	if p.saveFn != nil {
++		return p.saveFn(ctx)
++	}
++	return p.saveLocked(ctx)
++}
++
++func (p *PersistentUsagePlugin) saveLocked(ctx context.Context) error {
++	if p == nil {
++		return nil
++	}
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	default:
++	}
++	p.mu.RLock()
++	data := fileData{
++		Version:        fileVersion,
++		PricingSource:  pricingSource,
++		PricingVersion: PricingVersion,
++		UpdatedAt:      formatTime(p.updatedAt),
++		DroppedEvents:  p.droppedEvents.Load(),
++		Accounts:       make(map[string]AccountStats, len(p.accounts)),
++	}
++	for key, account := range p.accounts {
++		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
++		data.Accounts[key] = account
++	}
++	p.mu.RUnlock()
++	if err := os.MkdirAll(filepath.Dir(p.path), 0o755); err != nil {
++		return fmt.Errorf("create openai usage data dir: %w", err)
++	}
++	payload, errMarshal := json.MarshalIndent(data, "", "  ")
++	if errMarshal != nil {
++		return fmt.Errorf("marshal openai usage data: %w", errMarshal)
++	}
++	tmp := p.path + ".tmp"
++	if errWrite := os.WriteFile(tmp, payload, 0o644); errWrite != nil {
++		return fmt.Errorf("write openai usage temp file: %w", errWrite)
++	}
++	if errRename := os.Rename(tmp, p.path); errRename != nil {
++		_ = os.Remove(tmp)
++		return fmt.Errorf("replace openai usage file: %w", errRename)
++	}
++	return nil
++}
++
++func (p *PersistentUsagePlugin) load() {
++	if p == nil {
++		return
++	}
++	data, errRead := os.ReadFile(p.path)
++	if errRead != nil {
++		if !os.IsNotExist(errRead) {
++			log.WithError(errRead).Warn("openai usage: failed to read usage file")
++		}
++		return
++	}
++	var parsed fileData
++	if errUnmarshal := json.Unmarshal(data, &parsed); errUnmarshal != nil {
++		log.WithError(errUnmarshal).Warn("openai usage: failed to parse usage file")
++		return
++	}
++	p.mu.Lock()
++	p.accounts = make(map[string]AccountStats, len(parsed.Accounts))
++	for key, account := range parsed.Accounts {
++		account.AuthIndex = strings.TrimSpace(account.AuthIndex)
++		if account.AuthIndex == "" {
++			account.AuthIndex = strings.TrimSpace(key)
++		}
++		if ts, errParse := time.Parse(time.RFC3339, account.LastRequestedAt); errParse == nil {
++			account.lastRequestedAtTimeUTC = ts.UTC()
++		}
++		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
++		if account.AuthIndex != "" {
++			p.accounts[account.AuthIndex] = account
++		}
++	}
++	if ts, errParse := time.Parse(time.RFC3339, parsed.UpdatedAt); errParse == nil {
++		p.updatedAt = ts.UTC()
++	}
++	p.mu.Unlock()
++	p.droppedEvents.Store(parsed.DroppedEvents)
++}
++
++func (p *PersistentUsagePlugin) pricingMissingCountLocked() int64 {
++	if p == nil {
++		return 0
++	}
++	var total int64
++	for _, account := range p.accounts {
++		total += account.PricingMissingCount
++	}
++	return total
++}
++
++// EventFromRecord applies the fixed inclusion rule for this feature.
++func EventFromRecord(record coreusage.Record) (Event, bool) {
++	provider := strings.ToLower(strings.TrimSpace(record.Provider))
++	if provider != "codex" && provider != "openai" {
++		return Event{}, false
++	}
++	if !strings.EqualFold(strings.TrimSpace(record.AuthType), "oauth") {
++		return Event{}, false
++	}
++	authIndex := strings.TrimSpace(record.AuthIndex)
++	if authIndex == "" {
++		return Event{}, false
++	}
++	fileName := strings.TrimSpace(record.AuthFileName)
++	if fileName == "" || !strings.HasSuffix(strings.ToLower(fileName), ".json") {
++		return Event{}, false
++	}
++	fileName = filepath.Base(fileName)
++	detail := record.Detail
++	cacheRead := detail.CacheReadTokens
++	if cacheRead == 0 {
++		cacheRead = detail.CachedTokens
++	}
++	return Event{
++		AuthIndex:           authIndex,
++		AuthFileName:        fileName,
++		AccountEmail:        strings.TrimSpace(record.AccountEmail),
++		Model:               strings.TrimSpace(record.Model),
++		ServiceTier:         strings.TrimSpace(record.ServiceTier),
++		ResponseServiceTier: strings.TrimSpace(record.ResponseServiceTier),
++		RequestedAt:         record.RequestedAt,
++		UsageReported:       record.UsageReported || detail.UsageReported,
++		TotalTokensReported: record.TotalTokensReported || detail.TotalTokensReported,
++		InputTokens:         detail.InputTokens,
++		CachedInputTokens:   cacheRead,
++		CacheCreationTokens: detail.CacheCreationTokens,
++		OutputTokens:        detail.OutputTokens,
++		ReasoningTokens:     detail.ReasoningTokens,
++		TotalTokens:         detail.TotalTokens,
++	}, true
++}
++
++type modelPrice struct {
++	Short modelTierPrices
++	Long  *modelTierPrices
++}
++
++type modelTierPrices struct {
++	ThresholdTokens int64
++	Tiers           map[string]tierPrice
++}
++
++type tierPrice struct {
++	InputNanoUSDPerToken      int64
++	CachedNanoUSDPerToken     int64
++	OutputNanoUSDPerToken     int64
++	CacheWriteNanoUSDPerToken *int64
++}
++
++var priceTable = map[string]modelPrice{
++	"gpt-5.5": {
++		Short: modelTierPrices{
++			Tiers: map[string]tierPrice{
++				"default":  pricePerMillion("5.000", "0.500", "30.000"),
++				"priority": pricePerMillion("12.500", "1.250", "75.000"),
++				"batch":    pricePerMillion("2.500", "0.250", "15.000"),
++				"flex":     pricePerMillion("2.500", "0.250", "15.000"),
++			},
++		},
++		Long: &modelTierPrices{
++			ThresholdTokens: 272000,
++			Tiers: map[string]tierPrice{
++				"default": pricePerMillion("10.000", "1.000", "45.000"),
++				"batch":   pricePerMillion("5.000", "0.500", "22.500"),
++				"flex":    pricePerMillion("5.000", "0.500", "22.500"),
++			},
++		},
++	},
++}
++
++// Price calculates equivalent API estimated cost in nano-USD.
++func Price(event Event) (int64, bool) {
++	if !event.UsageReported {
++		return 0, false
++	}
++	canonical := CanonicalModel(event.Model)
++	model, ok := priceTable[canonical]
++	if !ok {
++		return 0, false
++	}
++	tierName := finalTier(event)
++	prices := model.Short
++	if model.Long != nil && event.InputTokens >= model.Long.ThresholdTokens {
++		if _, okTier := model.Long.Tiers[tierName]; !okTier {
++			return 0, false
++		}
++		prices = *model.Long
++	}
++	price, ok := prices.Tiers[tierName]
++	if !ok {
++		return 0, false
++	}
++	cacheRead := event.CachedInputTokens
++	if cacheRead < 0 {
++		cacheRead = 0
++	}
++	cacheCreation := event.CacheCreationTokens
++	if cacheCreation < 0 {
++		cacheCreation = 0
++	}
++	regularInput := event.InputTokens - cacheRead - cacheCreation
++	if regularInput < 0 {
++		regularInput = 0
++	}
++	cost := regularInput*price.InputNanoUSDPerToken +
++		cacheRead*price.CachedNanoUSDPerToken +
++		event.OutputTokens*price.OutputNanoUSDPerToken
++	if cacheCreation > 0 {
++		if price.CacheWriteNanoUSDPerToken != nil {
++			cost += cacheCreation * *price.CacheWriteNanoUSDPerToken
++		} else {
++			cost += cacheCreation * price.InputNanoUSDPerToken
++		}
++	}
++	return cost, true
++}
++
++func finalTier(event Event) string {
++	if strings.TrimSpace(event.ResponseServiceTier) != "" {
++		return normalizeTier(event.ResponseServiceTier)
++	}
++	return normalizeTier(event.ServiceTier)
++}
++
++func normalizeTier(tier string) string {
++	switch strings.ToLower(strings.TrimSpace(tier)) {
++	case "", "auto", "standard", "default":
++		return "default"
++	case "priority":
++		return "priority"
++	case "batch":
++		return "batch"
++	case "flex":
++		return "flex"
++	default:
++		return "default"
++	}
++}
++
++var dateSuffixPattern = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)
++
++// CanonicalModel normalizes only exact supported OpenAI model naming variants.
++func CanonicalModel(model string) string {
++	current := strings.ToLower(strings.TrimSpace(model))
++	for i := 0; i < 4; i++ {
++		next := canonicalModelStep(current)
++		if next == current {
++			break
++		}
++		current = next
++	}
++	return current
++}
++
++func canonicalModelStep(model string) string {
++	model = strings.TrimSpace(model)
++	if slash := strings.LastIndex(model, "/"); slash >= 0 && slash < len(model)-1 {
++		model = strings.TrimSpace(model[slash+1:])
++	}
++	if idx := strings.Index(model, "("); idx > 0 && strings.HasSuffix(model, ")") {
++		model = strings.TrimSpace(model[:idx])
++	}
++	model = dateSuffixPattern.ReplaceAllString(model, "")
++	return model
++}
++
++func pricePerMillion(input, cached, output string) tierPrice {
++	return tierPrice{
++		InputNanoUSDPerToken:  decimalUSDPerMillionToNano(input),
++		CachedNanoUSDPerToken: decimalUSDPerMillionToNano(cached),
++		OutputNanoUSDPerToken: decimalUSDPerMillionToNano(output),
++	}
++}
++
++func decimalUSDPerMillionToNano(value string) int64 {
++	rat, ok := new(big.Rat).SetString(strings.TrimSpace(value))
++	if !ok {
++		return 0
++	}
++	rat.Mul(rat, big.NewRat(1_000_000_000, 1_000_000))
++	num := new(big.Int).Set(rat.Num())
++	den := new(big.Int).Set(rat.Denom())
++	num.Add(num, new(big.Int).Div(den, big.NewInt(2)))
++	return new(big.Int).Quo(num, den).Int64()
++}
++
++// FormatUSD formats nano-USD as a decimal USD string.
++func FormatUSD(nano int64) string {
++	if nano == 0 {
++		return "0.000000000"
++	}
++	sign := ""
++	if nano < 0 {
++		sign = "-"
++		nano = -nano
++	}
++	whole := nano / 1_000_000_000
++	frac := nano % 1_000_000_000
++	return fmt.Sprintf("%s%d.%09d", sign, whole, frac)
++}
++
++func formatTime(ts time.Time) string {
++	if ts.IsZero() {
++		return ""
++	}
++	return ts.UTC().Format(time.RFC3339)
++}
+diff --git a/internal/openaiusage/store_test.go b/internal/openaiusage/store_test.go
+new file mode 100644
+index 0000000..0995c40
+--- /dev/null
++++ b/internal/openaiusage/store_test.go
+@@ -0,0 +1,445 @@
++package openaiusage
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
++)
++
++func TestEventFromRecordFiltersOnlyOpenAIOAuthJSON(t *testing.T) {
++	base := coreusage.Record{
++		Provider:      "codex",
++		AuthType:      "oauth",
++		AuthIndex:     "auth-1",
++		AuthFileName:  "one.json",
++		AccountEmail:  "user@example.com",
++		Model:         "gpt-5.5",
++		UsageReported: true,
++		Detail: coreusage.Detail{
++			InputTokens: 100,
++		},
++	}
++	if event, ok := EventFromRecord(base); !ok || event.AuthIndex != "auth-1" || event.AuthFileName != "one.json" {
++		t.Fatalf("EventFromRecord(base) = %+v, %v", event, ok)
++	}
++	tests := []struct {
++		name   string
++		mutate func(*coreusage.Record)
++	}{
++		{name: "api key", mutate: func(r *coreusage.Record) { r.AuthType = "apikey" }},
++		{name: "gemini", mutate: func(r *coreusage.Record) { r.Provider = "gemini" }},
++		{name: "openai compatibility", mutate: func(r *coreusage.Record) { r.Provider = "openai-compatibility" }},
++		{name: "missing auth index", mutate: func(r *coreusage.Record) { r.AuthIndex = "" }},
++		{name: "not json", mutate: func(r *coreusage.Record) { r.AuthFileName = "one.txt" }},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			record := base
++			tt.mutate(&record)
++			if event, ok := EventFromRecord(record); ok {
++				t.Fatalf("EventFromRecord() = %+v, true; want false", event)
++			}
++		})
++	}
++}
++
++func TestEventFromRecordNormalizesAuthFilePath(t *testing.T) {
++	record := coreusage.Record{
++		Provider:      "codex",
++		AuthType:      "oauth",
++		AuthIndex:     "auth-1",
++		AuthFileName:  filepath.Join(t.TempDir(), "codex-user.json"),
++		Model:         "gpt-5.5",
++		UsageReported: true,
++		Detail:        coreusage.Detail{InputTokens: 100},
++	}
++
++	event, ok := EventFromRecord(record)
++	if !ok {
++		t.Fatal("EventFromRecord() ok = false")
++	}
++	if event.AuthFileName != "codex-user.json" {
++		t.Fatalf("AuthFileName = %q, want codex-user.json", event.AuthFileName)
++	}
++}
++
++func TestApplyAggregatesByAuthIndexNotEmail(t *testing.T) {
++	plugin := NewPersistentUsagePlugin(filepath.Join(t.TempDir(), "openai-usage.json"))
++	defer func() {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		defer cancel()
++		_ = plugin.Close(ctx)
++	}()
++	now := time.Date(2026, 7, 14, 1, 2, 3, 0, time.UTC)
++	plugin.apply([]Event{
++		{
++			AuthIndex:           "idx-a",
++			AuthFileName:        "a.json",
++			AccountEmail:        "same@example.com",
++			Model:               "gpt-5.5",
++			RequestedAt:         now,
++			UsageReported:       true,
++			TotalTokensReported: true,
++			InputTokens:         1000,
++			CachedInputTokens:   400,
++			CacheCreationTokens: 100,
++			OutputTokens:        200,
++			ReasoningTokens:     50,
++			TotalTokens:         1200,
++		},
++		{
++			AuthIndex:     "idx-b",
++			AuthFileName:  "b.json",
++			AccountEmail:  "same@example.com",
++			Model:         "gpt-5.5",
++			RequestedAt:   now.Add(time.Second),
++			UsageReported: false,
++		},
++	})
++	accounts := plugin.Accounts()
++	if len(accounts) != 2 {
++		t.Fatalf("accounts = %d, want 2", len(accounts))
++	}
++	first, ok := plugin.Account("idx-a")
++	if !ok {
++		t.Fatal("missing idx-a")
++	}
++	if first.InputTokens != 1000 || first.CachedInputTokens != 400 || first.OutputTokens != 200 || first.ReasoningTokens != 50 || first.TotalTokens != 1200 {
++		t.Fatalf("idx-a tokens = %+v", first)
++	}
++	second, ok := plugin.Account("idx-b")
++	if !ok {
++		t.Fatal("missing idx-b")
++	}
++	if second.UsageMissingCount != 1 || second.RequestCount != 1 {
++		t.Fatalf("idx-b = %+v, want one missing request", second)
++	}
++}
++
++func TestPriceGPT55CachedReasoningAndTiers(t *testing.T) {
++	event := Event{
++		Model:               "openai/gpt-5.5-2026-07-14(high)",
++		ServiceTier:         "default",
++		UsageReported:       true,
++		TotalTokensReported: true,
++		InputTokens:         1000,
++		CachedInputTokens:   400,
++		CacheCreationTokens: 100,
++		OutputTokens:        200,
++		ReasoningTokens:     50,
++		TotalTokens:         1200,
++	}
++	if got := CanonicalModel(event.Model); got != "gpt-5.5" {
++		t.Fatalf("CanonicalModel() = %q, want gpt-5.5", got)
++	}
++	cost, ok := Price(event)
++	if !ok {
++		t.Fatal("Price() ok = false")
++	}
++	// regular input 500 * 5000 + cached 400 * 500 + cache creation 100 * 5000 + output 200 * 30000.
++	if want := int64(9_200_000); cost != want {
++		t.Fatalf("Price(default) = %d, want %d", cost, want)
++	}
++	event.ServiceTier = "priority"
++	priority, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(priority) ok = false")
++	}
++	if priority <= cost {
++		t.Fatalf("priority cost = %d, want above default %d", priority, cost)
++	}
++	event.ServiceTier = "batch"
++	batch, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(batch) ok = false")
++	}
++	if batch >= cost {
++		t.Fatalf("batch cost = %d, want below default %d", batch, cost)
++	}
++	event.ServiceTier = "flex"
++	flex, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(flex) ok = false")
++	}
++	if flex != batch {
++		t.Fatalf("flex cost = %d, want batch cost %d", flex, batch)
++	}
++}
++
++func TestPriceGPT55LongContextUsesTierSpecificLongPrice(t *testing.T) {
++	event := Event{
++		Model:             "gpt-5.5",
++		ServiceTier:       "flex",
++		UsageReported:     true,
++		InputTokens:       272000,
++		CachedInputTokens: 1000,
++		OutputTokens:      10,
++	}
++	longCost, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(long flex) ok = false")
++	}
++	event.InputTokens = 271999
++	shortCost, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(short flex) ok = false")
++	}
++	if longCost <= shortCost {
++		t.Fatalf("long flex cost = %d, want above short %d", longCost, shortCost)
++	}
++	event.InputTokens = 272000
++	event.ServiceTier = "priority"
++	if priorityLong, ok := Price(event); ok {
++		t.Fatalf("Price(priority long) = %d, true; want pricing missing", priorityLong)
++	}
++}
++
++func TestPriceUsesResponseServiceTierWhenPresent(t *testing.T) {
++	event := Event{
++		Model:               "gpt-5.5",
++		ServiceTier:         "priority",
++		ResponseServiceTier: "default",
++		UsageReported:       true,
++		InputTokens:         1000,
++	}
++	got, ok := Price(event)
++	if !ok {
++		t.Fatal("Price(request priority response default) ok = false")
++	}
++	if want := int64(5_000_000); got != want {
++		t.Fatalf("Price(request priority response default) = %d, want %d", got, want)
++	}
++	event.ServiceTier = "default"
++	event.ResponseServiceTier = "priority"
++	got, ok = Price(event)
++	if !ok {
++		t.Fatal("Price(request default response priority) ok = false")
++	}
++	if want := int64(12_500_000); got != want {
++		t.Fatalf("Price(request default response priority) = %d, want %d", got, want)
++	}
++}
++
++func TestPricingMissingCountForUnknownModelAndPriorityLongContext(t *testing.T) {
++	plugin := NewPersistentUsagePlugin(filepath.Join(t.TempDir(), "openai-usage.json"))
++	defer func() {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		defer cancel()
++		_ = plugin.Close(ctx)
++	}()
++	plugin.apply([]Event{
++		{
++			AuthIndex:     "unknown",
++			AuthFileName:  "unknown.json",
++			Model:         "unknown-model",
++			UsageReported: true,
++			InputTokens:   10,
++			OutputTokens:  20,
++		},
++		{
++			AuthIndex:     "priority-long",
++			AuthFileName:  "priority-long.json",
++			Model:         "gpt-5.5",
++			ServiceTier:   "priority",
++			UsageReported: true,
++			InputTokens:   272000,
++			OutputTokens:  1,
++		},
++	})
++	for _, authIndex := range []string{"unknown", "priority-long"} {
++		account, ok := plugin.Account(authIndex)
++		if !ok {
++			t.Fatalf("missing account %s", authIndex)
++		}
++		if account.RequestCount != 1 || account.PricingMissingCount != 1 || account.EstimatedCostNanoUSD != 0 {
++			t.Fatalf("%s account = %+v, want one pricing-missing charged at 0", authIndex, account)
++		}
++		if account.InputTokens == 0 || account.TotalTokens == 0 {
++			t.Fatalf("%s tokens were not accumulated: %+v", authIndex, account)
++		}
++	}
++	if got := plugin.Status().PricingMissingCount; got != 2 {
++		t.Fatalf("status PricingMissingCount = %d, want 2", got)
++	}
++}
++
++func TestJSONPersistenceAtomicLoad(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "data", "openai-usage.json")
++	plugin := NewPersistentUsagePlugin(path)
++	plugin.apply([]Event{{
++		AuthIndex:     "idx",
++		AuthFileName:  "idx.json",
++		Model:         "gpt-5.5",
++		UsageReported: true,
++		InputTokens:   1,
++		OutputTokens:  1,
++	}})
++	if err := plugin.save(context.Background()); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatalf("stat saved file: %v", err)
++	}
++	reloaded := NewPersistentUsagePlugin(path)
++	defer func() {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		defer cancel()
++		_ = plugin.Close(ctx)
++		_ = reloaded.Close(ctx)
++	}()
++	account, ok := reloaded.Account("idx")
++	if !ok || account.RequestCount != 1 || account.TotalTokens != 2 {
++		t.Fatalf("reloaded account = %+v, %v", account, ok)
++	}
++}
++
++func TestJSONLoadMissingPricingMissingCountDefaultsZero(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "data", "openai-usage.json")
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++	payload := []byte(`{
++  "version": 1,
++  "accounts": {
++    "idx": {
++      "auth_index": "idx",
++      "auth_file_name": "idx.json",
++      "request_count": 2,
++      "input_tokens": 3,
++      "estimated_cost_nano_usd": 4
++    }
++  }
++}`)
++	if err := os.WriteFile(path, payload, 0o644); err != nil {
++		t.Fatalf("write old usage json: %v", err)
++	}
++	plugin := NewPersistentUsagePlugin(path)
++	defer func() {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		defer cancel()
++		_ = plugin.Close(ctx)
++	}()
++	account, ok := plugin.Account("idx")
++	if !ok {
++		t.Fatal("missing old account")
++	}
++	if account.PricingMissingCount != 0 {
++		t.Fatalf("PricingMissingCount = %d, want 0", account.PricingMissingCount)
++	}
++}
++
++func TestPersistRetryKeepsBatch(t *testing.T) {
++	plugin := NewPersistentUsagePlugin(filepath.Join(t.TempDir(), "openai-usage.json"))
++	defer func() {
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		defer cancel()
++		_ = plugin.Close(ctx)
++	}()
++	failures := 0
++	plugin.saveFn = func(context.Context) error {
++		if failures < 2 {
++			failures++
++			return errors.New("temporary failure")
++		}
++		return nil
++	}
++	plugin.flushWithRetry(context.Background(), []Event{{
++		AuthIndex:     "idx",
++		AuthFileName:  "idx.json",
++		Model:         "gpt-5.5",
++		UsageReported: true,
++		InputTokens:   3,
++		OutputTokens:  4,
++	}})
++	account, ok := plugin.Account("idx")
++	if !ok || account.RequestCount != 1 || account.TotalTokens != 7 {
++		t.Fatalf("account after retry = %+v, %v", account, ok)
++	}
++	if failures != 2 {
++		t.Fatalf("failures = %d, want 2", failures)
++	}
++}
++
++func TestCloseCancelsPermanentPersistFailure(t *testing.T) {
++	plugin := NewPersistentUsagePlugin(filepath.Join(t.TempDir(), "openai-usage.json"))
++	plugin.saveFn = func(context.Context) error {
++		return errors.New("permanent failure")
++	}
++	record := coreusage.Record{
++		Provider:      "codex",
++		AuthType:      "oauth",
++		AuthIndex:     "idx",
++		AuthFileName:  "idx.json",
++		UsageReported: true,
++		Detail:        coreusage.Detail{InputTokens: 1},
++	}
++	plugin.HandleUsage(context.Background(), record)
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++	err := plugin.Close(ctx)
++	if !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("Close() error = %v, want DeadlineExceeded", err)
++	}
++	select {
++	case <-plugin.done:
++	default:
++		t.Fatal("worker did not exit after Close timeout")
++	}
++}
++
++func TestQueueFullDropsWithoutBlocking(t *testing.T) {
++	plugin := &PersistentUsagePlugin{
++		events:   make(chan Event, 1),
++		done:     make(chan struct{}),
++		accounts: map[string]AccountStats{},
++	}
++	plugin.events <- Event{AuthIndex: "filled"}
++	record := coreusage.Record{
++		Provider:      "codex",
++		AuthType:      "oauth",
++		AuthIndex:     "idx",
++		AuthFileName:  "idx.json",
++		UsageReported: true,
++		Detail:        coreusage.Detail{InputTokens: 1},
++	}
++	plugin.HandleUsage(context.Background(), record)
++	if got := plugin.droppedEvents.Load(); got != 1 {
++		t.Fatalf("droppedEvents = %d, want 1", got)
++	}
++	close(plugin.events)
++	close(plugin.done)
++}
++
++func TestUsageMissingDoesNotCharge(t *testing.T) {
++	event := Event{
++		Model:               "gpt-5.5",
++		UsageReported:       false,
++		TotalTokensReported: false,
++		InputTokens:         0,
++		OutputTokens:        0,
++	}
++	if cost, ok := Price(event); ok || cost != 0 {
++		t.Fatalf("Price(missing) = %d, %v; want 0,false", cost, ok)
++	}
++	record := coreusage.Record{
++		Provider:     "codex",
++		AuthType:     "oauth",
++		AuthIndex:    "idx",
++		AuthFileName: "idx.json",
++		StatusCode:   http.StatusOK,
++		Detail:       coreusage.Detail{},
++	}
++	parsed, ok := EventFromRecord(record)
++	if !ok {
++		t.Fatal("EventFromRecord() ok = false")
++	}
++	if parsed.UsageReported {
++		t.Fatal("UsageReported = true, want false")
++	}
++}
+diff --git a/internal/runtime/executor/helps/usage_helpers.go b/internal/runtime/executor/helps/usage_helpers.go
+index c4b8d82..cab35c9 100644
+--- a/internal/runtime/executor/helps/usage_helpers.go
++++ b/internal/runtime/executor/helps/usage_helpers.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"path/filepath"
+ 	"reflect"
+ 	"strings"
+ 	"sync"
+@@ -28,12 +29,15 @@ type UsageReporter struct {
+ 	alias        string
+ 	authID       string
+ 	authIndex    string
++	authFileName string
++	accountEmail string
+ 	authType     string
+ 	apiKey       string
+ 	source       string
+ 	reasoning    string
+ 	serviceTier  string
+ 	generate     bool
++	requestID    string
+ 	requestedAt  time.Time
+ 	ttftMu       sync.RWMutex
+ 	ttft         time.Duration
+@@ -73,14 +77,38 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
+ 		reasoning:   usage.ReasoningEffortFromContext(ctx),
+ 		serviceTier: usage.ServiceTierFromContext(ctx),
+ 		generate:    usage.GenerateFromContext(ctx),
++		requestID:   internallogging.GetRequestID(ctx),
+ 	}
+ 	if auth != nil {
+ 		reporter.authID = auth.ID
+ 		reporter.authIndex = auth.EnsureIndex()
++		reporter.authFileName = usageAuthFileNameSnapshot(auth)
++		if accountType, account := auth.AccountInfo(); accountType == "oauth" {
++			reporter.accountEmail = strings.TrimSpace(account)
++		}
+ 	}
+ 	return reporter
+ }
+ 
++func usageAuthFileNameSnapshot(auth *cliproxyauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	candidates := []string{auth.FileName}
++	if auth.Attributes != nil {
++		candidates = append(candidates, auth.Attributes[cliproxyauth.AttributePath])
++	}
++	candidates = append(candidates, auth.ID)
++	for _, candidate := range candidates {
++		candidate = strings.TrimSpace(candidate)
++		if candidate == "" {
++			continue
++		}
++		return filepath.Base(candidate)
++	}
++	return ""
++}
++
+ func ExecutorTypeName(executor any) string {
+ 	if executor == nil {
+ 		return ""
+@@ -269,7 +297,10 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
+ 		APIKey:              r.apiKey,
+ 		AuthID:              r.authID,
+ 		AuthIndex:           r.authIndex,
++		AuthFileName:        r.authFileName,
++		AccountEmail:        r.accountEmail,
+ 		AuthType:            r.authType,
++		RequestID:           r.requestID,
+ 		ReasoningEffort:     r.reasoning,
+ 		ServiceTier:         r.serviceTier,
+ 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
+@@ -278,6 +309,9 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
+ 		Latency:             r.latency(),
+ 		TTFT:                r.ttftDuration(),
+ 		Failed:              failed,
++		StatusCode:          fail.StatusCode,
++		UsageReported:       detail.UsageReported,
++		TotalTokensReported: detail.TotalTokensReported,
+ 		Fail:                fail,
+ 		Detail:              detail,
+ 	}
+@@ -581,9 +615,13 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
+ 		outputNode = usageNode.Get("output_tokens")
+ 	}
+ 	detail := usage.Detail{
+-		InputTokens:  inputNode.Int(),
+-		OutputTokens: outputNode.Int(),
+-		TotalTokens:  usageNode.Get("total_tokens").Int(),
++		InputTokens:   inputNode.Int(),
++		OutputTokens:  outputNode.Int(),
++		TotalTokens:   usageNode.Get("total_tokens").Int(),
++		UsageReported: true,
++	}
++	if usageNode.Get("total_tokens").Exists() {
++		detail.TotalTokensReported = true
+ 	}
+ 	cached := usageNode.Get("prompt_tokens_details.cached_tokens")
+ 	if !cached.Exists() {
+diff --git a/internal/runtime/executor/helps/usage_helpers_test.go b/internal/runtime/executor/helps/usage_helpers_test.go
+index c54b38e..06d3ff6 100644
+--- a/internal/runtime/executor/helps/usage_helpers_test.go
++++ b/internal/runtime/executor/helps/usage_helpers_test.go
+@@ -4,10 +4,12 @@ import (
+ 	"context"
+ 	"io"
+ 	"net/http"
++	"path/filepath"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+ )
+ 
+@@ -434,6 +436,36 @@ func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
+ 	}
+ }
+ 
++func TestUsageReporterBuildRecordUsesAuthPathWhenFileNameEmpty(t *testing.T) {
++	authPath := filepath.Join(t.TempDir(), "codex-user.json")
++	auth := &cliproxyauth.Auth{
++		ID:       "codex-user",
++		Provider: "codex",
++		Attributes: map[string]string{
++			cliproxyauth.AttributeAuthKind: cliproxyauth.AuthKindOAuth,
++			cliproxyauth.AttributePath:     authPath,
++		},
++		Metadata: map[string]any{
++			"email": "user@example.com",
++		},
++	}
++	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.5", auth)
++
++	record := reporter.buildRecord(usage.Detail{InputTokens: 3, UsageReported: true}, false)
++	if record.AuthFileName != "codex-user.json" {
++		t.Fatalf("AuthFileName = %q, want codex-user.json", record.AuthFileName)
++	}
++	if record.AuthIndex == "" {
++		t.Fatal("AuthIndex is empty")
++	}
++	if record.AuthType != cliproxyauth.AuthKindOAuth {
++		t.Fatalf("AuthType = %q, want oauth", record.AuthType)
++	}
++	if record.AccountEmail != "user@example.com" {
++		t.Fatalf("AccountEmail = %q, want user@example.com", record.AccountEmail)
++	}
++}
++
+ func TestNewExecutorUsageReporterIncludesExecutorType(t *testing.T) {
+ 	reporter := NewExecutorUsageReporter(context.Background(), &TestUsageExecutor{}, "gpt-5.4", nil)
+ 
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket.go b/sdk/api/handlers/openai/openai_responses_websocket.go
+index d9cd119..1e26e85 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket.go
+@@ -458,7 +458,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 			}
+ 		}
+ 		if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+-			pinnedAuthID = ""
++			releasePinnedAuth := true
++			if responsesWebsocketErrorStatus(forwardErrMsg) == http.StatusTooManyRequests {
++				releasePinnedAuth = responsesWebsocketPinnedAuthQuotaCooling(h.AuthManager, pinnedAuthID, modelName, time.Now())
++			}
++			if releasePinnedAuth {
++				pinnedAuthID = ""
++			}
+ 			forceTranscriptReplayNextRequest = true
+ 			if useUpstreamWebsocketPassthrough {
+ 				passthroughModelName = ""
+@@ -1499,12 +1505,7 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
+ 	if errMsg == nil {
+ 		return false
+ 	}
+-	status := errMsg.StatusCode
+-	if status <= 0 && errMsg.Error != nil {
+-		if se, ok := errMsg.Error.(interface{ StatusCode() int }); ok && se != nil {
+-			status = se.StatusCode()
+-		}
+-	}
++	status := responsesWebsocketErrorStatus(errMsg)
+ 	switch status {
+ 	case http.StatusUnauthorized,
+ 		http.StatusPaymentRequired,
+@@ -1531,6 +1532,48 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
+ 	return false
+ }
+ 
++func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
++	if errMsg == nil {
++		return 0
++	}
++	status := errMsg.StatusCode
++	if status <= 0 && errMsg.Error != nil {
++		if se, ok := errMsg.Error.(interface{ StatusCode() int }); ok && se != nil {
++			status = se.StatusCode()
++		}
++	}
++	return status
++}
++
++func responsesWebsocketPinnedAuthQuotaCooling(manager *coreauth.Manager, authID string, model string, now time.Time) bool {
++	if manager == nil {
++		return false
++	}
++	authID = strings.TrimSpace(authID)
++	if authID == "" {
++		return false
++	}
++	auth, ok := manager.GetByID(authID)
++	if !ok || auth == nil {
++		return false
++	}
++	if responsesWebsocketQuotaCooling(auth.Quota, now) {
++		return true
++	}
++	model = strings.TrimSpace(model)
++	if model == "" || auth.ModelStates == nil {
++		return false
++	}
++	if state := auth.ModelStates[model]; state != nil && responsesWebsocketQuotaCooling(state.Quota, now) {
++		return true
++	}
++	return false
++}
++
++func responsesWebsocketQuotaCooling(quota coreauth.QuotaState, now time.Time) bool {
++	return quota.Exceeded && !quota.NextRecoverAt.IsZero() && quota.NextRecoverAt.After(now)
++}
++
+ func collectResponsesWebsocketOutputItem(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+ 	if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
+ 		return
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_test.go b/sdk/api/handlers/openai/openai_responses_websocket_test.go
+index 4cd522e..8982a85 100644
+--- a/sdk/api/handlers/openai/openai_responses_websocket_test.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket_test.go
+@@ -367,7 +367,7 @@ func (e *websocketPinnedFailoverExecutor) ExecuteStream(_ context.Context, auth
+ 	e.payloads[authID] = append(e.payloads[authID], bytes.Clone(req.Payload))
+ 	e.mu.Unlock()
+ 
+-	if authID == "auth-a" && call == 2 {
++	if authID == "auth-a" && call >= 2 && call <= 12 {
+ 		chunks := make(chan coreexecutor.StreamChunk, 1)
+ 		chunks <- coreexecutor.StreamChunk{Err: websocketPinnedFailoverStatusError{
+ 			status: http.StatusTooManyRequests,
+@@ -2552,12 +2552,14 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+ 		}
+ 	}()
+ 
+-	requests := []string{
+-		`{"type":"response.create","model":"quota-model","input":[{"type":"message","id":"msg-1"}]}`,
+-		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`,
+-		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-3"}]}`,
++	requests := []string{`{"type":"response.create","model":"quota-model","input":[{"type":"message","id":"msg-1"}]}`}
++	wantTypes := []string{wsEventTypeCompleted}
++	for index := 2; index <= 12; index++ {
++		requests = append(requests, fmt.Sprintf(`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-%d"}]}`, index))
++		wantTypes = append(wantTypes, wsEventTypeError)
+ 	}
+-	wantTypes := []string{wsEventTypeCompleted, wsEventTypeError, wsEventTypeCompleted}
++	requests = append(requests, `{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-13"}]}`)
++	wantTypes = append(wantTypes, wsEventTypeCompleted)
+ 	for i := range requests {
+ 		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(requests[i])); errWrite != nil {
+ 			t.Fatalf("write websocket message %d: %v", i+1, errWrite)
+@@ -2569,13 +2571,22 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+ 		if got := gjson.GetBytes(payload, "type").String(); got != wantTypes[i] {
+ 			t.Fatalf("message %d payload type = %s, want %s: %s", i+1, got, wantTypes[i], payload)
+ 		}
+-		if i == 1 && int(gjson.GetBytes(payload, "status").Int()) != http.StatusTooManyRequests {
+-			t.Fatalf("quota payload status = %d, want %d: %s", gjson.GetBytes(payload, "status").Int(), http.StatusTooManyRequests, payload)
++		if i >= 1 && i <= 11 && int(gjson.GetBytes(payload, "status").Int()) != http.StatusTooManyRequests {
++			t.Fatalf("quota payload %d status = %d, want %d: %s", i, gjson.GetBytes(payload, "status").Int(), http.StatusTooManyRequests, payload)
+ 		}
+ 	}
+ 
+-	if got := executor.AuthIDs(); len(got) != 3 || got[0] != "auth-a" || got[1] != "auth-a" || got[2] != "auth-b" {
+-		t.Fatalf("selected auth IDs = %v, want [auth-a auth-a auth-b]", got)
++	gotAuthIDs := executor.AuthIDs()
++	if len(gotAuthIDs) != 13 {
++		t.Fatalf("selected auth IDs = %v, want 13 calls", gotAuthIDs)
++	}
++	for index := 0; index < 12; index++ {
++		if gotAuthIDs[index] != "auth-a" {
++			t.Fatalf("selected auth IDs = %v, want first 12 calls on auth-a", gotAuthIDs)
++		}
++	}
++	if gotAuthIDs[12] != "auth-b" {
++		t.Fatalf("selected auth IDs = %v, want final call on auth-b", gotAuthIDs)
+ 	}
+ 
+ 	authBPayloads := executor.Payloads("auth-b")
+@@ -2587,7 +2598,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+ 		t.Fatalf("previous_response_id leaked after auth failover: %s", authBPayload)
+ 	}
+ 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
+-	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
++	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-13"`) {
+ 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
+ 	}
+ }
+diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
+index fedf495..18d160b 100644
+--- a/sdk/cliproxy/auth/conductor.go
++++ b/sdk/cliproxy/auth/conductor.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+ 	log "github.com/sirupsen/logrus"
++	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+ )
+ 
+@@ -86,9 +87,22 @@ const (
+ 	refreshIneffectiveBackoff = 30 * time.Second
+ 	quotaBackoffBase          = time.Second
+ 	quotaBackoffMax           = 30 * time.Minute
++	quota429CooldownThreshold = 11
+ 	transientErrorCooldown    = time.Minute
+ )
+ 
++const (
++	invalidWorkspaceAuthStatus           = "无效认证"
++	invalidWorkspaceAuthReason           = "账号不是当前 workspace 成员"
++	invalidWorkspaceAuthErrorCode        = "biscuit_baker_service_auth_credential_error_status"
++	invalidWorkspaceAuthMessageSubstring = "not an active member of the selected workspace"
++	tokenInvalidAuthStatus               = "401认证失效"
++	tokenInvalidAuthReason               = "认证 token 已失效"
++	tokenInvalidAuthErrorCode            = "auth_unavailable"
++	tokenInvalidAuthErrorType            = "authentication_error"
++	tokenInvalidAuthMessage              = "Your authentication token has been invalidated. Please try signing in again."
++)
++
+ var quotaCooldownDisabled atomic.Bool
+ var transientErrorCooldownSeconds atomic.Int64
+ 
+@@ -3743,7 +3757,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+ 				clearAuthStateOnSuccess(auth, now)
+ 			}
+ 		} else {
+-			if result.Model != "" {
++			if invalidErr, okInvalid := invalidWorkspaceAuthErrorFromResult(result.Error); okInvalid {
++				applyInvalidWorkspaceAuthState(auth, invalidErr, now)
++			} else if tokenInvalidErr, okTokenInvalid := tokenInvalidAuthErrorFromResult(result.Error); okTokenInvalid {
++				applyTokenInvalidAuthState(auth, tokenInvalidErr, now)
++			} else if result.Model != "" {
+ 				if !isRequestScopedResultError(result.Error) {
+ 					disableCooling := m.cooldownDisabledForAuth(auth)
+ 					state := ensureModelState(auth, result.Model)
+@@ -3758,7 +3776,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+ 					}
+ 
+ 					statusCode := statusCodeFromResult(result.Error)
+-					if isModelSupportResultError(result.Error) {
++					activeQuotaCooldown := false
++					if statusCode != http.StatusTooManyRequests {
++						activeQuotaCooldown = resetPendingQuota429AfterNon429(&state.Quota, now)
++					}
++					if activeQuotaCooldown {
++						state.NextRetryAfter = state.Quota.NextRecoverAt
++						state.Quota.Reason = "quota"
++						suspendReason = "quota"
++						shouldSuspendModel = true
++						setModelQuota = true
++					} else if isModelSupportResultError(result.Error) {
+ 						next := now.Add(12 * time.Hour)
+ 						state.NextRetryAfter = next
+ 						suspendReason = "model_not_supported"
+@@ -3814,23 +3842,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+ 								shouldSuspendModel = true
+ 							}
+ 						case 429:
+-							var next time.Time
+-							backoffLevel := state.Quota.BackoffLevel
+-							if !disableCooling {
+-								if result.RetryAfter != nil {
+-									next = now.Add(*result.RetryAfter)
+-								} else {
+-									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
+-								}
+-							}
++							next, backoffLevel, shouldCooldown := nextQuota429Cooldown(state.Quota, result.RetryAfter, disableCooling, now)
+ 							state.NextRetryAfter = next
+ 							state.Quota = QuotaState{
+-								Exceeded:      true,
+-								Reason:        "quota",
++								Exceeded:      shouldCooldown,
++								Reason:        "",
+ 								NextRecoverAt: next,
+ 								BackoffLevel:  backoffLevel,
+ 							}
+-							if !disableCooling {
++							if shouldCooldown {
++								state.Quota.Reason = "quota"
+ 								suspendReason = "quota"
+ 								shouldSuspendModel = true
+ 								setModelQuota = true
+@@ -4352,6 +4373,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+ 		}
+ 	}
+ 	statusCode := statusCodeFromResult(resultErr)
++	if statusCode != http.StatusTooManyRequests && resetPendingQuota429AfterNon429(&auth.Quota, now) {
++		auth.Quota.Reason = "quota"
++		auth.NextRetryAfter = auth.Quota.NextRecoverAt
++		return
++	}
+ 	if isCloudflareChallengeResultError(resultErr) {
+ 		auth.StatusMessage = "cloudflare challenge"
+ 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
+@@ -4397,16 +4423,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+ 		}
+ 	case 429:
+ 		auth.StatusMessage = "quota exhausted"
+-		auth.Quota.Exceeded = true
+-		auth.Quota.Reason = "quota"
+-		var next time.Time
+-		if !disableCooling {
+-			if retryAfter != nil {
+-				next = now.Add(*retryAfter)
+-			} else {
+-				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
+-			}
++		next, backoffLevel, shouldCooldown := nextQuota429Cooldown(auth.Quota, retryAfter, disableCooling, now)
++		auth.Quota.Exceeded = shouldCooldown
++		if shouldCooldown {
++			auth.Quota.Reason = "quota"
++		} else {
++			auth.Quota.Reason = ""
++			auth.Unavailable = false
+ 		}
++		auth.Quota.BackoffLevel = backoffLevel
+ 		auth.Quota.NextRecoverAt = next
+ 		auth.NextRetryAfter = next
+ 	case 408, 500, 502, 503, 504:
+@@ -4423,6 +4448,123 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+ 	}
+ }
+ 
++func invalidWorkspaceAuthErrorFromResult(resultErr *Error) (*Error, bool) {
++	if resultErr == nil {
++		return nil, false
++	}
++
++	statusCode := statusCodeFromResult(resultErr)
++	message := strings.TrimSpace(resultErr.Message)
++	code := strings.TrimSpace(resultErr.Code)
++
++	if gjson.Valid(message) {
++		if statusCode == 0 {
++			if rawStatus := gjson.Get(message, "status"); rawStatus.Exists() {
++				statusCode = int(rawStatus.Int())
++			}
++		}
++		if parsedCode := strings.TrimSpace(gjson.Get(message, "error.code").String()); parsedCode != "" {
++			code = parsedCode
++		}
++		if parsedMessage := strings.TrimSpace(gjson.Get(message, "error.message").String()); parsedMessage != "" {
++			message = parsedMessage
++		}
++	}
++
++	if statusCode != http.StatusForbidden {
++		return nil, false
++	}
++	if code != invalidWorkspaceAuthErrorCode {
++		return nil, false
++	}
++	if !strings.Contains(message, invalidWorkspaceAuthMessageSubstring) {
++		return nil, false
++	}
++
++	return &Error{
++		Code:       invalidWorkspaceAuthErrorCode,
++		Message:    message,
++		HTTPStatus: http.StatusForbidden,
++	}, true
++}
++
++func tokenInvalidAuthErrorFromResult(resultErr *Error) (*Error, bool) {
++	if resultErr == nil {
++		return nil, false
++	}
++
++	statusCode := statusCodeFromResult(resultErr)
++	message := strings.TrimSpace(resultErr.Message)
++	code := strings.TrimSpace(resultErr.Code)
++	errorType := ""
++
++	if gjson.Valid(message) {
++		if statusCode == 0 {
++			if rawStatus := gjson.Get(message, "status"); rawStatus.Exists() {
++				statusCode = int(rawStatus.Int())
++			}
++		}
++		if parsedCode := strings.TrimSpace(gjson.Get(message, "error.code").String()); parsedCode != "" {
++			code = parsedCode
++		}
++		if parsedType := strings.TrimSpace(gjson.Get(message, "error.type").String()); parsedType != "" {
++			errorType = parsedType
++		}
++		if parsedMessage := strings.TrimSpace(gjson.Get(message, "error.message").String()); parsedMessage != "" {
++			message = parsedMessage
++		}
++	}
++
++	if statusCode != http.StatusUnauthorized {
++		return nil, false
++	}
++	if code != tokenInvalidAuthErrorCode {
++		return nil, false
++	}
++	if errorType != tokenInvalidAuthErrorType {
++		return nil, false
++	}
++	if message != tokenInvalidAuthMessage {
++		return nil, false
++	}
++
++	return &Error{
++		Code:       tokenInvalidAuthErrorCode,
++		Message:    message,
++		HTTPStatus: http.StatusUnauthorized,
++	}, true
++}
++
++func tokenInvalidAuthErrorFromRefreshError(err error, refreshErr *Error) (*Error, bool) {
++	var authErr *Error
++	if errors.As(err, &authErr) && authErr != nil {
++		if invalidErr, ok := tokenInvalidAuthErrorFromResult(authErr); ok {
++			return invalidErr, true
++		}
++	}
++	return tokenInvalidAuthErrorFromResult(refreshErr)
++}
++
++func applyInvalidWorkspaceAuthState(auth *Auth, invalidErr *Error, now time.Time) {
++	if auth == nil || invalidErr == nil {
++		return
++	}
++	auth.Status = Status(invalidWorkspaceAuthStatus)
++	auth.StatusMessage = invalidWorkspaceAuthReason
++	auth.LastError = cloneError(invalidErr)
++	auth.UpdatedAt = now
++}
++
++func applyTokenInvalidAuthState(auth *Auth, invalidErr *Error, now time.Time) {
++	if auth == nil || invalidErr == nil {
++		return
++	}
++	auth.Status = Status(tokenInvalidAuthStatus)
++	auth.StatusMessage = tokenInvalidAuthReason
++	auth.LastError = cloneError(invalidErr)
++	auth.UpdatedAt = now
++}
++
+ // quotaCooldownAfterFailure returns the recovery deadline and backoff level for
+ // a quota failure observed at now. Failures that land while a previous quota
+ // window is still open reuse that window instead of escalating, so a burst of
+@@ -4440,6 +4582,52 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int)
+ 	return next, nextLevel
+ }
+ 
++func resetPendingQuota429AfterNon429(quota *QuotaState, now time.Time) bool {
++	if quota == nil {
++		return false
++	}
++	if quota.Exceeded && !quota.NextRecoverAt.IsZero() && quota.NextRecoverAt.After(now) {
++		return true
++	}
++	*quota = QuotaState{}
++	return false
++}
++
++func nextQuota429Cooldown(quota QuotaState, retryAfter *time.Duration, disableCooling bool, now time.Time) (time.Time, int, bool) {
++	backoffLevel := quota.BackoffLevel
++	if backoffLevel < 0 {
++		backoffLevel = 0
++	}
++	if disableCooling {
++		return time.Time{}, backoffLevel, false
++	}
++
++	softLimit := quota429CooldownThreshold - 1
++	if softLimit < 0 {
++		softLimit = 0
++	}
++	if backoffLevel < softLimit {
++		return time.Time{}, backoffLevel + 1, false
++	}
++	if quota.NextRecoverAt.After(now) && backoffLevel >= quota429CooldownThreshold {
++		return quota.NextRecoverAt, backoffLevel, true
++	}
++
++	cooldownBackoffLevel := backoffLevel - quota429CooldownThreshold
++	if backoffLevel < quota429CooldownThreshold {
++		cooldownBackoffLevel = 0
++	}
++	if retryAfter != nil {
++		return now.Add(*retryAfter), quota429CooldownThreshold + cooldownBackoffLevel, true
++	}
++
++	effectiveQuota := quota
++	effectiveQuota.BackoffLevel = cooldownBackoffLevel
++	effectiveQuota.NextRecoverAt = time.Time{}
++	next, nextLevel := quotaCooldownAfterFailure(effectiveQuota, now)
++	return next, quota429CooldownThreshold + nextLevel, true
++}
++
+ // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
+ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
+ 	if prevLevel < 0 {
+@@ -5997,16 +6185,22 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
+ 	now := time.Now()
+ 	if err != nil {
+ 		unauthorized := isUnauthorizedError(err)
++		refreshErr := refreshErrorFromError(err)
++		tokenInvalidErr, tokenInvalid := tokenInvalidAuthErrorFromRefreshError(err, refreshErr)
+ 		shouldReschedule := false
+ 		m.mu.Lock()
+ 		if current := m.auths[id]; current != nil {
+-			current.LastError = refreshErrorFromError(err)
+-			if unauthorized {
++			if tokenInvalid {
++				applyTokenInvalidAuthState(current, tokenInvalidErr, now)
++				current.NextRefreshAfter = time.Time{}
++			} else if unauthorized {
++				current.LastError = refreshErr
+ 				current.NextRefreshAfter = time.Time{}
+ 				current.Unavailable = true
+ 				current.Status = StatusError
+ 				current.StatusMessage = "unauthorized"
+ 			} else {
++				current.LastError = refreshErr
+ 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+ 			}
+ 			m.auths[id] = current
+diff --git a/sdk/cliproxy/auth/conductor_invalid_workspace_test.go b/sdk/cliproxy/auth/conductor_invalid_workspace_test.go
+new file mode 100644
+index 0000000..4e94995
+--- /dev/null
++++ b/sdk/cliproxy/auth/conductor_invalid_workspace_test.go
+@@ -0,0 +1,170 @@
++package auth
++
++import (
++	"context"
++	"net/http"
++	"testing"
++)
++
++func TestManager_MarkResultInvalidWorkspaceAuth(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	auth := &Auth{
++		ID:       "invalid-workspace-auth",
++		Provider: "antigravity",
++		Status:   StatusActive,
++	}
++	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	upstreamMessage := "Personal access token owner is not an active member of the selected workspace."
++	m.MarkResult(context.Background(), Result{
++		AuthID:   auth.ID,
++		Provider: auth.Provider,
++		Model:    "gpt-5",
++		Success:  false,
++		Error: &Error{
++			HTTPStatus: http.StatusForbidden,
++			Message:    `{"error":{"message":"` + upstreamMessage + `","type":null,"code":"` + invalidWorkspaceAuthErrorCode + `","param":null},"status":403}`,
++		},
++	})
++
++	updated, ok := m.GetByID(auth.ID)
++	if !ok || updated == nil {
++		t.Fatalf("expected auth to be present")
++	}
++	if string(updated.Status) != invalidWorkspaceAuthStatus {
++		t.Fatalf("status = %q, want %q", updated.Status, invalidWorkspaceAuthStatus)
++	}
++	if updated.StatusMessage != invalidWorkspaceAuthReason {
++		t.Fatalf("status_message = %q, want %q", updated.StatusMessage, invalidWorkspaceAuthReason)
++	}
++	if updated.LastError == nil {
++		t.Fatalf("last_error = nil")
++	}
++	if updated.LastError.Code != invalidWorkspaceAuthErrorCode {
++		t.Fatalf("last_error.code = %q, want %q", updated.LastError.Code, invalidWorkspaceAuthErrorCode)
++	}
++	if updated.LastError.Message != upstreamMessage {
++		t.Fatalf("last_error.message = %q, want %q", updated.LastError.Message, upstreamMessage)
++	}
++	if updated.LastError.HTTPStatus != http.StatusForbidden {
++		t.Fatalf("last_error.http_status = %d, want %d", updated.LastError.HTTPStatus, http.StatusForbidden)
++	}
++}
++
++func TestManager_MarkResultOrdinary403DoesNotMarkInvalidWorkspaceAuth(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	auth := &Auth{
++		ID:       "ordinary-403-auth",
++		Provider: "antigravity",
++		Status:   StatusActive,
++	}
++	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	m.MarkResult(context.Background(), Result{
++		AuthID:   auth.ID,
++		Provider: auth.Provider,
++		Model:    "gpt-5",
++		Success:  false,
++		Error: &Error{
++			Code:       "forbidden",
++			Message:    "access denied",
++			HTTPStatus: http.StatusForbidden,
++		},
++	})
++
++	updated, ok := m.GetByID(auth.ID)
++	if !ok || updated == nil {
++		t.Fatalf("expected auth to be present")
++	}
++	if string(updated.Status) == invalidWorkspaceAuthStatus {
++		t.Fatalf("ordinary 403 was marked as %q", invalidWorkspaceAuthStatus)
++	}
++	if updated.StatusMessage == invalidWorkspaceAuthReason {
++		t.Fatalf("ordinary 403 got invalid workspace reason")
++	}
++}
++
++func TestManager_MarkResultTokenInvalidAuth(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	auth := &Auth{
++		ID:       "token-invalid-auth",
++		Provider: "antigravity",
++		Status:   StatusActive,
++	}
++	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	m.MarkResult(context.Background(), Result{
++		AuthID:   auth.ID,
++		Provider: auth.Provider,
++		Model:    "gpt-5",
++		Success:  false,
++		Error: &Error{
++			HTTPStatus: http.StatusUnauthorized,
++			Message:    `{"error":{"message":"` + tokenInvalidAuthMessage + `","type":"` + tokenInvalidAuthErrorType + `","code":"` + tokenInvalidAuthErrorCode + `"}}`,
++		},
++	})
++
++	updated, ok := m.GetByID(auth.ID)
++	if !ok || updated == nil {
++		t.Fatalf("expected auth to be present")
++	}
++	if string(updated.Status) != tokenInvalidAuthStatus {
++		t.Fatalf("status = %q, want %q", updated.Status, tokenInvalidAuthStatus)
++	}
++	if updated.StatusMessage != tokenInvalidAuthReason {
++		t.Fatalf("status_message = %q, want %q", updated.StatusMessage, tokenInvalidAuthReason)
++	}
++	if updated.LastError == nil {
++		t.Fatalf("last_error = nil")
++	}
++	if updated.LastError.Code != tokenInvalidAuthErrorCode {
++		t.Fatalf("last_error.code = %q, want %q", updated.LastError.Code, tokenInvalidAuthErrorCode)
++	}
++	if updated.LastError.Message != tokenInvalidAuthMessage {
++		t.Fatalf("last_error.message = %q, want %q", updated.LastError.Message, tokenInvalidAuthMessage)
++	}
++	if updated.LastError.HTTPStatus != http.StatusUnauthorized {
++		t.Fatalf("last_error.http_status = %d, want %d", updated.LastError.HTTPStatus, http.StatusUnauthorized)
++	}
++}
++
++func TestManager_MarkResultOrdinary401DoesNotMarkTokenInvalidAuth(t *testing.T) {
++	m := NewManager(nil, nil, nil)
++	auth := &Auth{
++		ID:       "ordinary-401-auth",
++		Provider: "antigravity",
++		Status:   StatusActive,
++	}
++	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	m.MarkResult(context.Background(), Result{
++		AuthID:   auth.ID,
++		Provider: auth.Provider,
++		Model:    "gpt-5",
++		Success:  false,
++		Error: &Error{
++			Code:       tokenInvalidAuthErrorCode,
++			Message:    tokenInvalidAuthMessage,
++			HTTPStatus: http.StatusUnauthorized,
++		},
++	})
++
++	updated, ok := m.GetByID(auth.ID)
++	if !ok || updated == nil {
++		t.Fatalf("expected auth to be present")
++	}
++	if string(updated.Status) == tokenInvalidAuthStatus {
++		t.Fatalf("ordinary 401 was marked as %q", tokenInvalidAuthStatus)
++	}
++	if updated.StatusMessage == tokenInvalidAuthReason {
++		t.Fatalf("ordinary 401 got token invalid reason")
++	}
++}
+diff --git a/sdk/cliproxy/auth/conductor_scheduler_refresh_test.go b/sdk/cliproxy/auth/conductor_scheduler_refresh_test.go
+index 8ccae63..96adb3e 100644
+--- a/sdk/cliproxy/auth/conductor_scheduler_refresh_test.go
++++ b/sdk/cliproxy/auth/conductor_scheduler_refresh_test.go
+@@ -173,13 +173,15 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
+ 		t.Fatalf("register old auth: %v", errRegister)
+ 	}
+ 
+-	manager.MarkResult(ctx, Result{
+-		AuthID:   oldAuth.ID,
+-		Provider: "gemini",
+-		Model:    "scheduler-cooldown-rebuild-model",
+-		Success:  false,
+-		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+-	})
++	for i := 0; i < quota429CooldownThreshold; i++ {
++		manager.MarkResult(ctx, Result{
++			AuthID:   oldAuth.ID,
++			Provider: "gemini",
++			Model:    "scheduler-cooldown-rebuild-model",
++			Success:  false,
++			Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
++		})
++	}
+ 
+ 	newAuth := &Auth{
+ 		ID:       "cooldown-stale-new",
+diff --git a/sdk/cliproxy/auth/cooldown_backoff_test.go b/sdk/cliproxy/auth/cooldown_backoff_test.go
+index b1d77eb..29a4602 100644
+--- a/sdk/cliproxy/auth/cooldown_backoff_test.go
++++ b/sdk/cliproxy/auth/cooldown_backoff_test.go
+@@ -29,12 +29,12 @@ func quotaResult(authID, model string) Result {
+ 	}
+ }
+ 
+-func TestMarkResultQuotaBackoffEscalatesOncePerWindow(t *testing.T) {
++func TestMarkResultQuota429CoolsDownOnEleventhAndSuccessClears(t *testing.T) {
+ 	withQuotaCooldownEnabled(t)
+ 
+ 	manager := NewManager(nil, nil, nil)
+ 	auth := &Auth{
+-		ID:       "auth-quota-window",
++		ID:       "auth-quota-eleventh",
+ 		Provider: "codex",
+ 		Metadata: map[string]any{"type": "codex"},
+ 	}
+@@ -42,113 +42,199 @@ func TestMarkResultQuotaBackoffEscalatesOncePerWindow(t *testing.T) {
+ 		t.Fatalf("Register returned error: %v", errRegister)
+ 	}
+ 
++	for i := 1; i <= quota429CooldownThreshold-1; i++ {
++		manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
++		updated, ok := manager.GetByID(auth.ID)
++		if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
++			t.Fatalf("expected model state after failure %d", i)
++		}
++		state := updated.ModelStates["gpt-5"]
++		if state.Quota.BackoffLevel != i {
++			t.Fatalf("failure %d BackoffLevel = %d, want %d", i, state.Quota.BackoffLevel, i)
++		}
++		if !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
++			t.Fatalf("failure %d cooled down early: next=%v quota=%v", i, state.NextRetryAfter, state.Quota.NextRecoverAt)
++		}
++		if state.Quota.Exceeded {
++			t.Fatalf("failure %d marked model quota exceeded before threshold: %+v", i, state.Quota)
++		}
++	}
++
+ 	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
+-	first, ok := manager.GetByID(auth.ID)
+-	if !ok || first == nil || first.ModelStates["gpt-5"] == nil {
+-		t.Fatalf("expected model state after first failure")
++	cooled, ok := manager.GetByID(auth.ID)
++	if !ok || cooled == nil || cooled.ModelStates["gpt-5"] == nil {
++		t.Fatalf("expected model state after eleventh failure")
+ 	}
+-	firstState := first.ModelStates["gpt-5"]
+-	if firstState.Quota.BackoffLevel != 1 {
+-		t.Fatalf("expected BackoffLevel 1 after first failure, got %d", firstState.Quota.BackoffLevel)
++	state := cooled.ModelStates["gpt-5"]
++	if state.Quota.BackoffLevel < quota429CooldownThreshold {
++		t.Fatalf("eleventh BackoffLevel = %d, want >= %d", state.Quota.BackoffLevel, quota429CooldownThreshold)
+ 	}
+-	if !firstState.Quota.NextRecoverAt.After(time.Now()) {
+-		t.Fatalf("expected open cooldown window after first failure, got %v", firstState.Quota.NextRecoverAt)
++	if !state.NextRetryAfter.After(time.Now()) || !state.Quota.NextRecoverAt.After(time.Now()) {
++		t.Fatalf("eleventh did not cool down: next=%v quota=%v", state.NextRetryAfter, state.Quota.NextRecoverAt)
+ 	}
+ 
+-	// A second in-flight failure lands while the first window is still open.
+-	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
+-	second, ok := manager.GetByID(auth.ID)
+-	if !ok || second == nil || second.ModelStates["gpt-5"] == nil {
+-		t.Fatalf("expected model state after second failure")
++	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5", Success: true})
++	recovered, ok := manager.GetByID(auth.ID)
++	if !ok || recovered == nil || recovered.ModelStates["gpt-5"] == nil {
++		t.Fatalf("expected model state after success")
++	}
++	state = recovered.ModelStates["gpt-5"]
++	if state.Quota.BackoffLevel != 0 || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
++		t.Fatalf("success did not clear 429 state: %+v", state)
++	}
++}
++
++func TestApplyAuthFailureStateQuota429CoolsDownOnEleventh(t *testing.T) {
++	now := time.Now()
++	quotaErr := &Error{Code: "rate_limit", Message: "quota", HTTPStatus: http.StatusTooManyRequests}
++	auth := &Auth{ID: "auth-level-quota"}
++
++	for i := 1; i <= quota429CooldownThreshold-1; i++ {
++		applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Duration(i)*time.Millisecond), false)
++		if auth.Quota.BackoffLevel != i {
++			t.Fatalf("failure %d BackoffLevel = %d, want %d", i, auth.Quota.BackoffLevel, i)
++		}
++		if !auth.NextRetryAfter.IsZero() || !auth.Quota.NextRecoverAt.IsZero() {
++			t.Fatalf("failure %d cooled down early: next=%v quota=%v", i, auth.NextRetryAfter, auth.Quota.NextRecoverAt)
++		}
++		if auth.Unavailable || auth.Quota.Exceeded {
++			t.Fatalf("failure %d marked auth unavailable before threshold: unavailable=%v quota=%+v", i, auth.Unavailable, auth.Quota)
++		}
+ 	}
+-	secondState := second.ModelStates["gpt-5"]
+-	if secondState.Quota.BackoffLevel != 1 {
+-		t.Fatalf("expected BackoffLevel to stay 1 for in-window failure, got %d", secondState.Quota.BackoffLevel)
++
++	applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Second), false)
++	if auth.Quota.BackoffLevel < quota429CooldownThreshold {
++		t.Fatalf("eleventh BackoffLevel = %d, want >= %d", auth.Quota.BackoffLevel, quota429CooldownThreshold)
+ 	}
+-	if !secondState.Quota.NextRecoverAt.Equal(firstState.Quota.NextRecoverAt) {
+-		t.Fatalf("expected NextRecoverAt to stay %v for in-window failure, got %v", firstState.Quota.NextRecoverAt, secondState.Quota.NextRecoverAt)
++	if !auth.NextRetryAfter.After(now) || !auth.Quota.NextRecoverAt.After(now) {
++		t.Fatalf("eleventh did not cool down: next=%v quota=%v", auth.NextRetryAfter, auth.Quota.NextRecoverAt)
+ 	}
+-	if !secondState.NextRetryAfter.Equal(firstState.NextRetryAfter) {
+-		t.Fatalf("expected NextRetryAfter to stay %v for in-window failure, got %v", firstState.NextRetryAfter, secondState.NextRetryAfter)
++
++	clearAuthStateOnSuccess(auth, now.Add(2*time.Second))
++	if auth.Quota.BackoffLevel != 0 || !auth.NextRetryAfter.IsZero() || !auth.Quota.NextRecoverAt.IsZero() {
++		t.Fatalf("success did not clear auth-level 429 state: %+v", auth.Quota)
+ 	}
+ }
+ 
+-func TestMarkResultQuotaBackoffEscalatesAfterWindowExpiry(t *testing.T) {
++func TestMarkResultQuota429RequiresConsecutiveFailures(t *testing.T) {
+ 	withQuotaCooldownEnabled(t)
+ 
+-	expired := time.Now().Add(-time.Second)
+ 	manager := NewManager(nil, nil, nil)
+-	auth := &Auth{
+-		ID:       "auth-quota-expired",
+-		Provider: "codex",
+-		Metadata: map[string]any{"type": "codex"},
+-		ModelStates: map[string]*ModelState{
+-			"gpt-5": {
+-				Status:         StatusError,
+-				Unavailable:    true,
+-				NextRetryAfter: expired,
+-				Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: expired, BackoffLevel: 3},
+-			},
+-		},
+-	}
++	auth := &Auth{ID: "auth-quota-consecutive", Provider: "codex"}
+ 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+ 		t.Fatalf("Register returned error: %v", errRegister)
+ 	}
++	model := "gpt-5-consecutive"
++	serverErr := Result{
++		AuthID:   auth.ID,
++		Provider: "codex",
++		Model:    model,
++		Success:  false,
++		Error:    &Error{Code: "server_error", Message: "server", HTTPStatus: http.StatusInternalServerError},
++	}
+ 
+-	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
++	for i := 0; i < 5; i++ {
++		manager.MarkResult(context.Background(), quotaResult(auth.ID, model))
++	}
++	manager.MarkResult(context.Background(), serverErr)
++	for i := 0; i < 6; i++ {
++		manager.MarkResult(context.Background(), quotaResult(auth.ID, model))
++	}
+ 	updated, ok := manager.GetByID(auth.ID)
+-	if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
+-		t.Fatalf("expected model state after failure")
++	if !ok || updated.ModelStates[model] == nil {
++		t.Fatalf("missing model state")
++	}
++	state := updated.ModelStates[model]
++	if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 6 {
++		t.Fatalf("non-consecutive 429 cooled down or counted incorrectly: %+v", state.Quota)
++	}
++
++	for i := 0; i < quota429CooldownThreshold-6; i++ {
++		manager.MarkResult(context.Background(), quotaResult(auth.ID, model))
++	}
++	cooled, ok := manager.GetByID(auth.ID)
++	if !ok || cooled.ModelStates[model] == nil {
++		t.Fatalf("missing cooled model state")
+ 	}
+-	state := updated.ModelStates["gpt-5"]
+-	if state.Quota.BackoffLevel != 4 {
+-		t.Fatalf("expected BackoffLevel 4 after post-window failure, got %d", state.Quota.BackoffLevel)
++	state = cooled.ModelStates[model]
++	if !state.Quota.Exceeded || state.Quota.BackoffLevel < quota429CooldownThreshold || !state.Quota.NextRecoverAt.After(time.Now()) {
++		t.Fatalf("eleven consecutive 429 did not cool down: %+v", state.Quota)
+ 	}
+-	if !state.Quota.NextRecoverAt.After(time.Now()) {
+-		t.Fatalf("expected a fresh cooldown window, got %v", state.Quota.NextRecoverAt)
++	cooldownUntil := state.Quota.NextRecoverAt
++
++	manager.MarkResult(context.Background(), serverErr)
++	stillCooled, ok := manager.GetByID(auth.ID)
++	if !ok || stillCooled.ModelStates[model] == nil {
++		t.Fatalf("missing model state after concurrent 500")
++	}
++	state = stillCooled.ModelStates[model]
++	if !state.Quota.Exceeded || !state.Quota.NextRecoverAt.Equal(cooldownUntil) {
++		t.Fatalf("concurrent 500 cleared active 429 cooldown: %+v want recover %v", state.Quota, cooldownUntil)
++	}
++
++	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: model, Success: true})
++	for i := 0; i < quota429CooldownThreshold-1; i++ {
++		manager.MarkResult(context.Background(), quotaResult(auth.ID, model))
++	}
++	restarted, ok := manager.GetByID(auth.ID)
++	if !ok || restarted.ModelStates[model] == nil {
++		t.Fatalf("missing restarted model state")
++	}
++	state = restarted.ModelStates[model]
++	if state.Quota.Exceeded || state.Quota.BackoffLevel != quota429CooldownThreshold-1 {
++		t.Fatalf("success did not restart 429 count from zero: %+v", state.Quota)
++	}
++	manager.MarkResult(context.Background(), quotaResult(auth.ID, model))
++	recooled, ok := manager.GetByID(auth.ID)
++	if !ok || recooled.ModelStates[model] == nil {
++		t.Fatalf("missing recooled model state")
++	}
++	state = recooled.ModelStates[model]
++	if !state.Quota.Exceeded {
++		t.Fatalf("eleventh 429 after success did not cool down: %+v", state.Quota)
+ 	}
+ }
+ 
+-func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
++func TestApplyAuthFailureStateQuota429RequiresConsecutiveFailures(t *testing.T) {
+ 	now := time.Now()
+ 	quotaErr := &Error{Code: "rate_limit", Message: "quota", HTTPStatus: http.StatusTooManyRequests}
+-	auth := &Auth{ID: "auth-level-quota"}
++	serverErr := &Error{Code: "server_error", Message: "server", HTTPStatus: http.StatusInternalServerError}
++	auth := &Auth{ID: "auth-level-consecutive"}
+ 
+-	applyAuthFailureState(auth, quotaErr, nil, now, false)
+-	if auth.Quota.BackoffLevel != 1 {
+-		t.Fatalf("expected BackoffLevel 1 after first failure, got %d", auth.Quota.BackoffLevel)
++	for i := 0; i < 5; i++ {
++		applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Duration(i)*time.Millisecond), false)
+ 	}
+-	firstRecover := auth.Quota.NextRecoverAt
+-	if !firstRecover.Equal(now.Add(time.Second)) {
+-		t.Fatalf("expected first window to close at %v, got %v", now.Add(time.Second), firstRecover)
++	applyAuthFailureState(auth, serverErr, nil, now.Add(10*time.Millisecond), false)
++	for i := 0; i < 6; i++ {
++		applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Duration(20+i)*time.Millisecond), false)
++	}
++	if auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() || auth.Quota.BackoffLevel != 6 {
++		t.Fatalf("non-consecutive auth 429 cooled down or counted incorrectly: %+v", auth.Quota)
+ 	}
+ 
+-	// In-window failure keeps the current window and level.
+-	applyAuthFailureState(auth, quotaErr, nil, now.Add(100*time.Millisecond), false)
+-	if auth.Quota.BackoffLevel != 1 {
+-		t.Fatalf("expected BackoffLevel to stay 1 for in-window failure, got %d", auth.Quota.BackoffLevel)
++	for i := 0; i < quota429CooldownThreshold-6; i++ {
++		applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Duration(40+i)*time.Millisecond), false)
+ 	}
+-	if !auth.Quota.NextRecoverAt.Equal(firstRecover) {
+-		t.Fatalf("expected NextRecoverAt to stay %v for in-window failure, got %v", firstRecover, auth.Quota.NextRecoverAt)
++	if !auth.Quota.Exceeded || auth.Quota.BackoffLevel < quota429CooldownThreshold || !auth.Quota.NextRecoverAt.After(now) {
++		t.Fatalf("auth eleven consecutive 429 did not cool down: %+v", auth.Quota)
+ 	}
++	cooldownUntil := auth.Quota.NextRecoverAt
+ 
+-	// A failure after the window expired escalates to the next level.
+-	applyAuthFailureState(auth, quotaErr, nil, now.Add(2*time.Second), false)
+-	if auth.Quota.BackoffLevel != 2 {
+-		t.Fatalf("expected BackoffLevel 2 after post-window failure, got %d", auth.Quota.BackoffLevel)
+-	}
+-	if !auth.Quota.NextRecoverAt.Equal(now.Add(4 * time.Second)) {
+-		t.Fatalf("expected second window to close at %v, got %v", now.Add(4*time.Second), auth.Quota.NextRecoverAt)
++	applyAuthFailureState(auth, serverErr, nil, now.Add(time.Second), false)
++	if !auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.Equal(cooldownUntil) {
++		t.Fatalf("auth concurrent 500 cleared active 429 cooldown: %+v want recover %v", auth.Quota, cooldownUntil)
+ 	}
+ 
+-	// A provider supplied retry hint always takes effect, even in-window.
+-	retryAfter := 10 * time.Second
+-	applyAuthFailureState(auth, quotaErr, &retryAfter, now.Add(3*time.Second), false)
+-	if auth.Quota.BackoffLevel != 2 {
+-		t.Fatalf("expected BackoffLevel to stay 2 with retry hint, got %d", auth.Quota.BackoffLevel)
++	clearAuthStateOnSuccess(auth, now.Add(2*time.Second))
++	for i := 0; i < quota429CooldownThreshold-1; i++ {
++		applyAuthFailureState(auth, quotaErr, nil, now.Add(time.Duration(3+i)*time.Second), false)
++	}
++	if auth.Quota.Exceeded || auth.Quota.BackoffLevel != quota429CooldownThreshold-1 {
++		t.Fatalf("auth success did not restart 429 count from zero: %+v", auth.Quota)
+ 	}
+-	if !auth.Quota.NextRecoverAt.Equal(now.Add(13 * time.Second)) {
+-		t.Fatalf("expected retry hint window to close at %v, got %v", now.Add(13*time.Second), auth.Quota.NextRecoverAt)
++	applyAuthFailureState(auth, quotaErr, nil, now.Add(20*time.Second), false)
++	if !auth.Quota.Exceeded {
++		t.Fatalf("auth eleventh 429 after success did not cool down: %+v", auth.Quota)
+ 	}
+ }
+ 
+diff --git a/sdk/cliproxy/auth/error_events_test.go b/sdk/cliproxy/auth/error_events_test.go
+index 33afca8..3b74283 100644
+--- a/sdk/cliproxy/auth/error_events_test.go
++++ b/sdk/cliproxy/auth/error_events_test.go
+@@ -28,20 +28,22 @@ func TestManagerMarkResultPublishesErrorEventAfterAuthStateUpdate(t *testing.T)
+ 		t.Fatalf("Register returned error: %v", errRegister)
+ 	}
+ 
+-	manager.MarkResult(context.Background(), Result{
+-		AuthID:   auth.ID,
+-		Provider: "codex",
+-		Model:    "gpt-5",
+-		Success:  false,
+-		Error: &Error{
+-			Code:       "rate_limit",
+-			Message:    `{"error":"quota"}`,
+-			Retryable:  true,
+-			HTTPStatus: http.StatusTooManyRequests,
+-		},
+-	})
+-
+-	payload := requireErrorSubscriberPayload(t, subscriber)
++	var payload []byte
++	for i := 0; i < quota429CooldownThreshold; i++ {
++		manager.MarkResult(context.Background(), Result{
++			AuthID:   auth.ID,
++			Provider: "codex",
++			Model:    "gpt-5",
++			Success:  false,
++			Error: &Error{
++				Code:       "rate_limit",
++				Message:    `{"error":"quota"}`,
++				Retryable:  true,
++				HTTPStatus: http.StatusTooManyRequests,
++			},
++		})
++		payload = requireErrorSubscriberPayload(t, subscriber)
++	}
+ 
+ 	var event struct {
+ 		Provider   string `json:"provider"`
+diff --git a/sdk/cliproxy/auth/scheduler_test.go b/sdk/cliproxy/auth/scheduler_test.go
+index 0329651..3fa5024 100644
+--- a/sdk/cliproxy/auth/scheduler_test.go
++++ b/sdk/cliproxy/auth/scheduler_test.go
+@@ -1153,13 +1153,15 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
+ 		t.Fatalf("Register(auth-b) error = %v", errRegister)
+ 	}
+ 
+-	manager.MarkResult(context.Background(), Result{
+-		AuthID:   "auth-a",
+-		Provider: "gemini",
+-		Model:    "test-model",
+-		Success:  false,
+-		Error:    &Error{HTTPStatus: 429, Message: "quota"},
+-	})
++	for i := 0; i < quota429CooldownThreshold; i++ {
++		manager.MarkResult(context.Background(), Result{
++			AuthID:   "auth-a",
++			Provider: "gemini",
++			Model:    "test-model",
++			Success:  false,
++			Error:    &Error{HTTPStatus: 429, Message: "quota"},
++		})
++	}
+ 
+ 	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+ 	if errPick != nil {
+diff --git a/sdk/cliproxy/service.go b/sdk/cliproxy/service.go
+index 61c6dad..c95773e 100644
+--- a/sdk/cliproxy/service.go
++++ b/sdk/cliproxy/service.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+@@ -99,6 +100,9 @@ type Service struct {
+ 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
+ 	pluginHost *pluginhost.Host
+ 
++	openAIUsageMu     sync.Mutex
++	openAIUsagePlugin *openaiusage.PersistentUsagePlugin
++
+ 	// shutdownOnce ensures shutdown is called only once.
+ 	shutdownOnce sync.Once
+ 
+@@ -788,6 +792,29 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
+ 	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
+ }
+ 
++func (s *Service) configureOpenAIUsage() {
++	if s == nil {
++		return
++	}
++	s.openAIUsageMu.Lock()
++	defer s.openAIUsageMu.Unlock()
++	if s.openAIUsagePlugin != nil {
++		return
++	}
++	plugin := openaiusage.NewPersistentUsagePlugin(openaiusage.ResolvePath(s.configPath))
++	usage.RegisterNamedPlugin(openaiusage.PluginName, plugin)
++	s.openAIUsagePlugin = plugin
++}
++
++func (s *Service) openAIUsageStoreForServer() openaiusage.Store {
++	if s == nil {
++		return nil
++	}
++	s.openAIUsageMu.Lock()
++	defer s.openAIUsageMu.Unlock()
++	return s.openAIUsagePlugin
++}
++
+ func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
+ 	if cfg == nil {
+ 		return "", nil
+@@ -1322,8 +1349,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
+ 
+ 	s.applyRetryConfig(newCfg)
+ 	s.configureCooldownStateStore(newCfg)
++	s.configureOpenAIUsage()
+ 	s.applyPprofConfig(newCfg)
+ 	if s.server != nil {
++		s.server.SetOpenAIUsageStore(s.openAIUsageStoreForServer())
+ 		s.server.UpdateClients(newCfg)
+ 	}
+ 	s.cfgMu.Lock()
+@@ -1637,6 +1666,7 @@ func (s *Service) Run(ctx context.Context) error {
+ 
+ 	s.applyRetryConfig(s.cfg)
+ 	s.configureCooldownStateStore(s.cfg)
++	s.configureOpenAIUsage()
+ 
+ 	s.registerPluginAuthParser()
+ 	if s.coreManager != nil && !homeEnabled {
+@@ -1681,7 +1711,9 @@ func (s *Service) Run(ctx context.Context) error {
+ 	}
+ 
+ 	// handlers no longer depend on legacy clients; pass nil slice initially
+-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
++	serverOptions := append([]api.ServerOption{}, s.serverOptions...)
++	serverOptions = append(serverOptions, api.WithOpenAIUsageStore(s.openAIUsageStoreForServer()))
++	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
+ 	s.syncPluginRuntimeConfig(ctx)
+ 	if homeEnabled {
+ 		s.syncPluginModelRuntime(ctx)
+@@ -1878,7 +1910,29 @@ func (s *Service) Shutdown(ctx context.Context) error {
+ 			}
+ 		}
+ 
+-		usage.StopDefault()
++		if errStopUsage := usage.StopDefaultAndWait(ctx); errStopUsage != nil {
++			log.Errorf("failed to stop usage manager: %v", errStopUsage)
++			if shutdownErr == nil {
++				shutdownErr = errStopUsage
++			}
++		}
++		usage.UnregisterNamedPlugin(openaiusage.PluginName)
++		s.openAIUsageMu.Lock()
++		openAIUsagePlugin := s.openAIUsagePlugin
++		s.openAIUsageMu.Unlock()
++		if openAIUsagePlugin != nil {
++			if errCloseUsage := openAIUsagePlugin.Close(ctx); errCloseUsage != nil {
++				log.Errorf("failed to close OpenAI usage plugin: %v", errCloseUsage)
++				if shutdownErr == nil {
++					shutdownErr = errCloseUsage
++				}
++			}
++		}
++		s.openAIUsageMu.Lock()
++		if s.openAIUsagePlugin == openAIUsagePlugin {
++			s.openAIUsagePlugin = nil
++		}
++		s.openAIUsageMu.Unlock()
+ 	})
+ 	return shutdownErr
+ }
+diff --git a/sdk/cliproxy/usage/manager.go b/sdk/cliproxy/usage/manager.go
+index 0c9529f..bda2ef4 100644
+--- a/sdk/cliproxy/usage/manager.go
++++ b/sdk/cliproxy/usage/manager.go
+@@ -28,6 +28,8 @@ type Record struct {
+ 	APIKey       string
+ 	AuthID       string
+ 	AuthIndex    string
++	AuthFileName string
++	AccountEmail string
+ 	AuthType     string
+ 	Source       string
+ 	// ReasoningEffort stores the translated upstream thinking level for request event logs.
+@@ -39,16 +41,20 @@ type Record struct {
+ 	RequestServiceTier string
+ 	// ResponseServiceTier stores the final tier reported by the upstream response.
+ 	ResponseServiceTier string
++	RequestID           string
+ 	// Generate reports whether the client requested actual generation.
+ 	// nil or true means generation is enabled; only an explicit false disables generation.
+ 	// Use GenerateFlag to set the value and GenerateEnabled to read it with the default.
+-	Generate    *bool
+-	RequestedAt time.Time
+-	Latency     time.Duration
+-	TTFT        time.Duration
+-	Failed      bool
+-	Fail        Failure
+-	Detail      Detail
++	Generate            *bool
++	RequestedAt         time.Time
++	Latency             time.Duration
++	TTFT                time.Duration
++	Failed              bool
++	StatusCode          int
++	UsageReported       bool
++	TotalTokensReported bool
++	Fail                Failure
++	Detail              Detail
+ 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
+ 	ResponseHeaders http.Header
+ }
+@@ -69,6 +75,8 @@ type Detail struct {
+ 	CacheCreationTokens int64
+ 	TotalTokens         int64
+ 	ResponseServiceTier string
++	UsageReported       bool
++	TotalTokensReported bool
+ }
+ 
+ type requestedModelAliasContextKey struct{}
+@@ -218,9 +226,10 @@ type queueItem struct {
+ 
+ // Manager maintains a queue of usage records and delivers them to registered plugins.
+ type Manager struct {
+-	once     sync.Once
+-	stopOnce sync.Once
+-	cancel   context.CancelFunc
++	runMu   sync.Mutex
++	cancel  context.CancelFunc
++	done    chan struct{}
++	running bool
+ 
+ 	mu     sync.Mutex
+ 	cond   *sync.Cond
+@@ -244,14 +253,36 @@ func (m *Manager) Start(ctx context.Context) {
+ 	if m == nil {
+ 		return
+ 	}
+-	m.once.Do(func() {
+-		if ctx == nil {
+-			ctx = context.Background()
+-		}
+-		var workerCtx context.Context
+-		workerCtx, m.cancel = context.WithCancel(ctx)
+-		go m.run(workerCtx)
+-	})
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	m.runMu.Lock()
++	if m.running {
++		m.runMu.Unlock()
++		return
++	}
++	workerCtx, cancel := context.WithCancel(ctx)
++	done := make(chan struct{})
++	m.cancel = cancel
++	m.done = done
++	m.running = true
++	m.mu.Lock()
++	m.closed = false
++	m.mu.Unlock()
++	m.runMu.Unlock()
++
++	go func() {
++		defer func() {
++			m.runMu.Lock()
++			if m.done == done {
++				m.running = false
++				m.cancel = nil
++			}
++			m.runMu.Unlock()
++			close(done)
++		}()
++		m.run(workerCtx)
++	}()
+ }
+ 
+ // Stop stops the dispatcher and drains the queue.
+@@ -259,15 +290,45 @@ func (m *Manager) Stop() {
+ 	if m == nil {
+ 		return
+ 	}
+-	m.stopOnce.Do(func() {
+-		if m.cancel != nil {
+-			m.cancel()
+-		}
+-		m.mu.Lock()
+-		m.closed = true
+-		m.mu.Unlock()
+-		m.cond.Broadcast()
+-	})
++	m.mu.Lock()
++	m.closed = true
++	m.mu.Unlock()
++
++	m.runMu.Lock()
++	cancel := m.cancel
++	m.runMu.Unlock()
++	if cancel != nil {
++		cancel()
++	}
++	m.cond.Broadcast()
++}
++
++// StopAndWait stops the dispatcher, drains queued records, and waits for the
++// worker to finish until ctx is cancelled.
++func (m *Manager) StopAndWait(ctx context.Context) error {
++	if m == nil {
++		return nil
++	}
++	m.runMu.Lock()
++	done := m.done
++	running := m.running
++	m.runMu.Unlock()
++	if !running || done == nil {
++		m.Start(context.Background())
++		m.runMu.Lock()
++		done = m.done
++		m.runMu.Unlock()
++	}
++	m.Stop()
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
+ }
+ 
+ // Register appends a plugin to the delivery list.
+@@ -304,6 +365,27 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
+ 	m.pluginsMu.Unlock()
+ }
+ 
++// UnregisterNamed removes a named plugin while leaving its slice slot empty.
++func (m *Manager) UnregisterNamed(name string) {
++	if m == nil {
++		return
++	}
++	name = strings.TrimSpace(name)
++	if name == "" {
++		return
++	}
++	m.pluginsMu.Lock()
++	if m.named != nil {
++		if index, exists := m.named[name]; exists {
++			if index >= 0 && index < len(m.plugins) {
++				m.plugins[index] = nil
++			}
++			delete(m.named, name)
++		}
++	}
++	m.pluginsMu.Unlock()
++}
++
+ // Publish enqueues a usage record for processing. If no plugin is registered
+ // the record will be discarded downstream.
+ func (m *Manager) Publish(ctx context.Context, record Record) {
+@@ -375,6 +457,9 @@ func RegisterPlugin(plugin Plugin) { DefaultManager().Register(plugin) }
+ // RegisterNamedPlugin registers or replaces a named plugin on the default manager.
+ func RegisterNamedPlugin(name string, plugin Plugin) { DefaultManager().RegisterNamed(name, plugin) }
+ 
++// UnregisterNamedPlugin removes a named plugin from the default manager.
++func UnregisterNamedPlugin(name string) { DefaultManager().UnregisterNamed(name) }
++
+ // PublishRecord publishes a record using the default manager.
+ func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }
+ 
+@@ -383,3 +468,7 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
+ 
+ // StopDefault stops the default manager's dispatcher.
+ func StopDefault() { DefaultManager().Stop() }
++
++// StopDefaultAndWait stops the default manager and waits for queued records to
++// be delivered.
++func StopDefaultAndWait(ctx context.Context) error { return DefaultManager().StopAndWait(ctx) }
+diff --git a/sdk/cliproxy/usage/manager_test.go b/sdk/cliproxy/usage/manager_test.go
+index 6f7b1fb..6f70c8a 100644
+--- a/sdk/cliproxy/usage/manager_test.go
++++ b/sdk/cliproxy/usage/manager_test.go
+@@ -2,51 +2,143 @@ package usage
+ 
+ import (
+ 	"context"
++	"sync"
+ 	"testing"
++	"time"
+ )
+ 
+-func TestGenerateEnabledDefaultsNilToTrue(t *testing.T) {
+-	if !GenerateEnabled(nil) {
+-		t.Fatalf("GenerateEnabled(nil) = false, want true")
++type testUsagePlugin struct {
++	mu         sync.Mutex
++	requestIDs []string
++	ch         chan string
++}
++
++func newTestUsagePlugin(buffer int) *testUsagePlugin {
++	return &testUsagePlugin{ch: make(chan string, buffer)}
++}
++
++func (p *testUsagePlugin) HandleUsage(ctx context.Context, record Record) {
++	p.mu.Lock()
++	p.requestIDs = append(p.requestIDs, record.RequestID)
++	p.mu.Unlock()
++
++	select {
++	case p.ch <- record.RequestID:
++	default:
+ 	}
+ }
+ 
+-func TestGenerateEnabledHonorsExplicitFalse(t *testing.T) {
+-	if GenerateEnabled(GenerateFlag(false)) {
+-		t.Fatalf("GenerateEnabled(false) = true, want false")
++func (p *testUsagePlugin) count() int {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return len(p.requestIDs)
++}
++
++func (p *testUsagePlugin) contains(requestID string) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for _, existing := range p.requestIDs {
++		if existing == requestID {
++			return true
++		}
+ 	}
++	return false
+ }
+ 
+-func TestGenerateEnabledHonorsExplicitTrue(t *testing.T) {
+-	if !GenerateEnabled(GenerateFlag(true)) {
+-		t.Fatalf("GenerateEnabled(true) = false, want true")
++func waitForUsageRecord(t *testing.T, p *testUsagePlugin, requestID string) {
++	t.Helper()
++
++	timeout := time.After(time.Second)
++	for {
++		select {
++		case got := <-p.ch:
++			if got == requestID {
++				return
++			}
++		case <-timeout:
++			t.Fatalf("timed out waiting for usage record %q", requestID)
++		}
+ 	}
+ }
+ 
+-func TestGenerateFromContextDefaultsMissingToTrue(t *testing.T) {
+-	if !GenerateFromContext(context.Background()) {
+-		t.Fatalf("GenerateFromContext(background) = false, want true")
++func stopUsageManagerForTest(t *testing.T, m *Manager) {
++	t.Helper()
++
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if err := m.StopAndWait(ctx); err != nil {
++		t.Fatalf("failed to stop usage manager: %v", err)
+ 	}
+ }
+ 
+-func TestGenerateFromContextHonorsExplicitFalse(t *testing.T) {
+-	ctx := WithGenerate(context.Background(), false)
+-	if GenerateFromContext(ctx) {
+-		t.Fatalf("GenerateFromContext(false) = true, want false")
++func TestManagerRestartsAfterStopAndWait(t *testing.T) {
++	m := NewManager(4)
++	plugin := newTestUsagePlugin(2)
++	m.Register(plugin)
++
++	m.Start(context.Background())
++	m.Publish(context.Background(), Record{RequestID: "first"})
++	waitForUsageRecord(t, plugin, "first")
++	stopUsageManagerForTest(t, m)
++
++	m.Start(context.Background())
++	m.Publish(context.Background(), Record{RequestID: "second"})
++	waitForUsageRecord(t, plugin, "second")
++	stopUsageManagerForTest(t, m)
++
++	if plugin.count() != 2 {
++		t.Fatalf("handled records = %d, want 2", plugin.count())
++	}
++	if !plugin.contains("first") || !plugin.contains("second") {
++		t.Fatalf("handled records = %#v, want first and second", plugin.requestIDs)
+ 	}
+ }
+ 
+-func TestRecordOmittedGenerateIsEnabled(t *testing.T) {
+-	// Existing callers construct Record without setting Generate.
+-	// Omission must remain distinguishable from explicit false and default to true.
+-	record := Record{
+-		Provider: "openai",
+-		Model:    "gpt-5.4",
++func TestRegisterNamedReplacesPluginAfterRestart(t *testing.T) {
++	m := NewManager(4)
++	first := newTestUsagePlugin(1)
++	second := newTestUsagePlugin(1)
++
++	m.RegisterNamed("openai-usage-test", first)
++	m.Start(context.Background())
++	m.Publish(context.Background(), Record{RequestID: "first"})
++	waitForUsageRecord(t, first, "first")
++	stopUsageManagerForTest(t, m)
++
++	m.RegisterNamed("openai-usage-test", second)
++	m.Start(context.Background())
++	m.Publish(context.Background(), Record{RequestID: "second"})
++	waitForUsageRecord(t, second, "second")
++	stopUsageManagerForTest(t, m)
++
++	if first.count() != 1 {
++		t.Fatalf("first plugin handled %d records, want 1", first.count())
++	}
++	if second.count() != 1 {
++		t.Fatalf("second plugin handled %d records, want 1", second.count())
++	}
++	if first.contains("second") {
++		t.Fatalf("first plugin handled record after replacement")
+ 	}
+-	if record.Generate != nil {
+-		t.Fatalf("Record.Generate = %v, want nil for omitted field", record.Generate)
++}
++
++func TestUnregisterNamedPluginStopsDispatch(t *testing.T) {
++	m := NewManager(4)
++	plugin := newTestUsagePlugin(1)
++
++	m.RegisterNamed("openai-usage-test", plugin)
++	m.Start(context.Background())
++	m.Publish(context.Background(), Record{RequestID: "first"})
++	waitForUsageRecord(t, plugin, "first")
++
++	m.UnregisterNamed("openai-usage-test")
++	m.Publish(context.Background(), Record{RequestID: "second"})
++	stopUsageManagerForTest(t, m)
++
++	if plugin.count() != 1 {
++		t.Fatalf("plugin handled %d records after unregister, want 1", plugin.count())
+ 	}
+-	if !GenerateEnabled(record.Generate) {
+-		t.Fatalf("GenerateEnabled(omitted) = false, want true")
++	if plugin.contains("second") {
++		t.Fatalf("plugin handled record after unregister")
+ 	}
+ }

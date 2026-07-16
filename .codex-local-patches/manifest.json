@@ -1,0 +1,43 @@
+{
+    "upstream_version":  "v7.2.80",
+    "upstream_source":  "E:\\CLIProxyAPI\\.codex-upstream\\v7.2.80-src-20260716-210653\\CLIProxyAPI-7.2.80",
+    "generated_at":  "2026-07-16T16:31:50Z",
+    "changed_files":  [
+                          "internal/api/handlers/management/api_tools.go",
+                          "internal/api/handlers/management/api_tools_test.go",
+                          "internal/api/handlers/management/auth_files.go",
+                          "internal/api/handlers/management/auth_files_delete_test.go",
+                          "internal/api/handlers/management/auth_files_openai_usage_test.go",
+                          "internal/api/handlers/management/handler.go",
+                          "internal/api/handlers/management/openai_usage.go",
+                          "internal/api/handlers/management/openai_usage_test.go",
+                          "internal/api/server.go",
+                          "internal/openaiusage/store.go",
+                          "internal/openaiusage/store_test.go",
+                          "internal/runtime/executor/helps/usage_helpers.go",
+                          "sdk/api/handlers/openai/openai_responses_websocket.go",
+                          "sdk/api/handlers/openai/openai_responses_websocket_test.go",
+                          "sdk/cliproxy/auth/conductor.go",
+                          "sdk/cliproxy/auth/conductor_invalid_workspace_test.go",
+                          "sdk/cliproxy/auth/conductor_scheduler_refresh_test.go",
+                          "sdk/cliproxy/auth/cooldown_backoff_test.go",
+                          "sdk/cliproxy/auth/error_events_test.go",
+                          "sdk/cliproxy/auth/scheduler_test.go",
+                          "sdk/cliproxy/service.go",
+                          "sdk/cliproxy/usage/manager.go",
+                          "sdk/cliproxy/usage/manager_test.go",
+                          "static/management.html"
+                      ],
+    "patches":  [
+                    {
+                        "file":  "001-backend-local-customizations.patch",
+                        "size":  144015,
+                        "sha256":  "C3EA8530052715E9152C561A5B96F0F3672185956B05F384508C00F267B6AC71"
+                    },
+                    {
+                        "file":  "002-management-panel-local-ui.patch",
+                        "size":  2562574,
+                        "sha256":  "4205EBE33F0A16C3A765E84483643BF8CC15C98667ED94E4F94C9D07F50EC5F4"
+                    }
+                ]
+}
