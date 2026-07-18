@@ -4,10 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/big"
+	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -24,8 +23,8 @@ const (
 	MaxBatchSize   = 100
 	fileVersion    = 1
 	defaultDBFile  = "openai-usage.json"
-	pricingSource  = "OpenAI API pricing page https://developers.openai.com/api/docs/pricing checked 2026-07-14"
-	PricingVersion = "openai-official-pricing-2026-07-14"
+	PricingSource  = "Sub2API / Wei-Shaw LiteLLM-compatible price table https://github.com/Wei-Shaw/sub2api"
+	PricingVersion = "sub2api-model-pricing-2026-07-17"
 )
 
 var retryDelays = []time.Duration{
@@ -41,6 +40,11 @@ type Store interface {
 	Status() StatusResponse
 	Accounts() []AccountStats
 	Account(authIndex string) (AccountStats, bool)
+}
+
+// QuotaSampleRecorder records Codex quota samples without expanding the read-only Store interface.
+type QuotaSampleRecorder interface {
+	RecordQuotaSample(ctx context.Context, sample QuotaSample) error
 }
 
 // StatusResponse is returned by /v0/management/openai-usage/status.
@@ -66,21 +70,47 @@ type AccountsResponse struct {
 
 // AccountStats is the fixed public account/file aggregate.
 type AccountStats struct {
-	AuthIndex              string `json:"auth_index"`
-	AuthFileName           string `json:"auth_file_name"`
-	AccountEmail           string `json:"account_email"`
-	RequestCount           int64  `json:"request_count"`
-	InputTokens            int64  `json:"input_tokens"`
-	CachedInputTokens      int64  `json:"cached_input_tokens"`
-	OutputTokens           int64  `json:"output_tokens"`
-	ReasoningTokens        int64  `json:"reasoning_tokens"`
-	TotalTokens            int64  `json:"total_tokens"`
-	UsageMissingCount      int64  `json:"usage_missing_count"`
-	PricingMissingCount    int64  `json:"pricing_missing_count"`
-	EstimatedCostNanoUSD   int64  `json:"estimated_cost_nano_usd"`
-	EstimatedCostUSD       string `json:"estimated_cost_usd"`
-	LastRequestedAt        string `json:"last_requested_at,omitempty"`
-	lastRequestedAtTimeUTC time.Time
+	AuthIndex                      string  `json:"auth_index"`
+	AuthFileName                   string  `json:"auth_file_name"`
+	DisplayName                    string  `json:"display_name,omitempty"`
+	Provider                       string  `json:"provider,omitempty"`
+	AuthType                       string  `json:"auth_type,omitempty"`
+	AccountEmail                   string  `json:"account_email"`
+	RequestCount                   int64   `json:"request_count"`
+	InputTokens                    int64   `json:"input_tokens"`
+	CachedInputTokens              int64   `json:"cached_input_tokens"`
+	OutputTokens                   int64   `json:"output_tokens"`
+	ReasoningTokens                int64   `json:"reasoning_tokens"`
+	TotalTokens                    int64   `json:"total_tokens"`
+	UsageMissingCount              int64   `json:"usage_missing_count"`
+	PricingMissingCount            int64   `json:"pricing_missing_count"`
+	EstimatedCostNanoUSD           int64   `json:"estimated_cost_nano_usd"`
+	EstimatedCostUSD               string  `json:"estimated_cost_usd"`
+	FullQuotaEstimatedNanoUSD      int64   `json:"full_quota_estimated_nano_usd,omitempty"`
+	FullQuotaEstimatedUSD          string  `json:"full_quota_estimated_usd,omitempty"`
+	QuotaSampleWindowID            string  `json:"quota_sample_window_id,omitempty"`
+	QuotaSampleUsedPercent         float64 `json:"quota_sample_used_percent,omitempty"`
+	QuotaSampleCostNanoUSD         int64   `json:"quota_sample_cost_nano_usd,omitempty"`
+	QuotaSampleUsageMissingCount   int64   `json:"quota_sample_usage_missing_count,omitempty"`
+	QuotaSamplePricingMissingCount int64   `json:"quota_sample_pricing_missing_count,omitempty"`
+	QuotaSampledAt                 string  `json:"quota_sampled_at,omitempty"`
+	QuotaEstimateSamplePercent     float64 `json:"quota_estimate_sample_percent,omitempty"`
+	QuotaEstimateSampleCostNanoUSD int64   `json:"quota_estimate_sample_cost_nano_usd,omitempty"`
+	QuotaEstimateUpdatedAt         string  `json:"quota_estimate_updated_at,omitempty"`
+	LastRequestedAt                string  `json:"last_requested_at,omitempty"`
+	lastRequestedAtTimeUTC         time.Time
+}
+
+type QuotaSample struct {
+	AuthIndex    string
+	AuthFileName string
+	DisplayName  string
+	Provider     string
+	AuthType     string
+	AccountEmail string
+	WindowID     string
+	UsedPercent  float64
+	SampledAt    time.Time
 }
 
 type fileData struct {
@@ -95,6 +125,9 @@ type fileData struct {
 type Event struct {
 	AuthIndex           string
 	AuthFileName        string
+	DisplayName         string
+	Provider            string
+	AuthType            string
 	AccountEmail        string
 	Model               string
 	ServiceTier         string
@@ -110,7 +143,7 @@ type Event struct {
 	TotalTokens         int64
 }
 
-// PersistentUsagePlugin records only OpenAI/Codex OAuth JSON usage into a JSON file.
+// PersistentUsagePlugin records OpenAI-compatible usage into a JSON file.
 type PersistentUsagePlugin struct {
 	path   string
 	events chan Event
@@ -173,7 +206,7 @@ func (p *PersistentUsagePlugin) Status() StatusResponse {
 		BatchSize:           MaxBatchSize,
 		DroppedEvents:       p.droppedEvents.Load(),
 		PricingMissingCount: pricingMissingCount,
-		PricingSource:       pricingSource,
+		PricingSource:       PricingSource,
 		PricingVersion:      PricingVersion,
 		UpdatedAt:           updatedAt,
 	}
@@ -186,8 +219,7 @@ func (p *PersistentUsagePlugin) Accounts() []AccountStats {
 	p.mu.RLock()
 	out := make([]AccountStats, 0, len(p.accounts))
 	for _, account := range p.accounts {
-		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
-		out = append(out, account)
+		out = append(out, accountForOutput(account))
 	}
 	p.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool {
@@ -210,9 +242,89 @@ func (p *PersistentUsagePlugin) Account(authIndex string) (AccountStats, bool) {
 	account, ok := p.accounts[authIndex]
 	p.mu.RUnlock()
 	if ok {
-		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
+		account = accountForOutput(account)
 	}
 	return account, ok
+}
+
+func (p *PersistentUsagePlugin) RecordQuotaSample(ctx context.Context, sample QuotaSample) error {
+	if p == nil {
+		return nil
+	}
+	sample.AuthIndex = strings.TrimSpace(sample.AuthIndex)
+	if sample.AuthIndex == "" {
+		return nil
+	}
+	sample.WindowID = strings.ToLower(strings.TrimSpace(sample.WindowID))
+	if sample.WindowID != "weekly" && sample.WindowID != "monthly" {
+		return nil
+	}
+	if !isFinitePercent(sample.UsedPercent) {
+		return nil
+	}
+	if sample.SampledAt.IsZero() {
+		sample.SampledAt = time.Now().UTC()
+	} else {
+		sample.SampledAt = sample.SampledAt.UTC()
+	}
+	p.mu.Lock()
+	account := p.accounts[sample.AuthIndex]
+	account.AuthIndex = sample.AuthIndex
+	if strings.TrimSpace(sample.Provider) != "" {
+		account.Provider = sample.Provider
+	}
+	if strings.TrimSpace(sample.AuthType) != "" {
+		account.AuthType = sample.AuthType
+	}
+	if strings.TrimSpace(sample.AuthFileName) != "" {
+		account.AuthFileName = filepath.Base(strings.TrimSpace(sample.AuthFileName))
+	}
+	if strings.TrimSpace(sample.DisplayName) != "" {
+		account.DisplayName = strings.TrimSpace(sample.DisplayName)
+	} else if account.DisplayName == "" && account.AuthFileName != "" {
+		account.DisplayName = account.AuthFileName
+	}
+	if strings.TrimSpace(sample.AccountEmail) != "" {
+		account.AccountEmail = strings.TrimSpace(sample.AccountEmail)
+	}
+
+	previousWindow := strings.TrimSpace(account.QuotaSampleWindowID)
+	previousPercent := account.QuotaSampleUsedPercent
+	previousCost := account.QuotaSampleCostNanoUSD
+	previousUsageMissing := account.QuotaSampleUsageMissingCount
+	previousPricingMissing := account.QuotaSamplePricingMissingCount
+	currentCost := account.EstimatedCostNanoUSD
+	currentUsageMissing := account.UsageMissingCount
+	currentPricingMissing := account.PricingMissingCount
+
+	if previousWindow == sample.WindowID &&
+		sample.UsedPercent > previousPercent &&
+		currentCost > previousCost &&
+		sample.UsedPercent-previousPercent >= 1.0 &&
+		currentUsageMissing == previousUsageMissing &&
+		currentPricingMissing == previousPricingMissing {
+		percentDelta := sample.UsedPercent - previousPercent
+		costDelta := currentCost - previousCost
+		account.FullQuotaEstimatedNanoUSD = int64(math.Round(float64(costDelta) / (percentDelta / 100)))
+		account.FullQuotaEstimatedUSD = FormatUSD(account.FullQuotaEstimatedNanoUSD)
+		account.QuotaEstimateSamplePercent = percentDelta
+		account.QuotaEstimateSampleCostNanoUSD = costDelta
+		account.QuotaEstimateUpdatedAt = sample.SampledAt.Format(time.RFC3339)
+	}
+
+	account.QuotaSampleWindowID = sample.WindowID
+	account.QuotaSampleUsedPercent = sample.UsedPercent
+	account.QuotaSampleCostNanoUSD = currentCost
+	account.QuotaSampleUsageMissingCount = currentUsageMissing
+	account.QuotaSamplePricingMissingCount = currentPricingMissing
+	account.QuotaSampledAt = sample.SampledAt.Format(time.RFC3339)
+	account = accountForOutput(account)
+	p.accounts[sample.AuthIndex] = account
+	if p.updatedAt.IsZero() || sample.SampledAt.After(p.updatedAt) {
+		p.updatedAt = sample.SampledAt
+	}
+	p.mu.Unlock()
+	return p.save(ctx)
 }
 
 func (p *PersistentUsagePlugin) HandleUsage(_ context.Context, record coreusage.Record) {
@@ -349,8 +461,17 @@ func (p *PersistentUsagePlugin) apply(batch []Event) {
 	for _, event := range batch {
 		account := p.accounts[event.AuthIndex]
 		account.AuthIndex = event.AuthIndex
+		if strings.TrimSpace(event.Provider) != "" {
+			account.Provider = event.Provider
+		}
+		if strings.TrimSpace(event.AuthType) != "" {
+			account.AuthType = event.AuthType
+		}
 		if strings.TrimSpace(event.AuthFileName) != "" {
 			account.AuthFileName = event.AuthFileName
+		}
+		if strings.TrimSpace(event.DisplayName) != "" {
+			account.DisplayName = event.DisplayName
 		}
 		if strings.TrimSpace(event.AccountEmail) != "" {
 			account.AccountEmail = event.AccountEmail
@@ -366,7 +487,7 @@ func (p *PersistentUsagePlugin) apply(batch []Event) {
 		}
 		if !event.UsageReported {
 			account.UsageMissingCount++
-			p.accounts[event.AuthIndex] = account
+			p.accounts[event.AuthIndex] = accountForOutput(account)
 			continue
 		}
 		account.InputTokens += event.InputTokens
@@ -379,8 +500,7 @@ func (p *PersistentUsagePlugin) apply(batch []Event) {
 		} else {
 			account.PricingMissingCount++
 		}
-		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
-		p.accounts[event.AuthIndex] = account
+		p.accounts[event.AuthIndex] = accountForOutput(account)
 	}
 	p.updatedAt = now
 }
@@ -416,15 +536,14 @@ func (p *PersistentUsagePlugin) saveLocked(ctx context.Context) error {
 	p.mu.RLock()
 	data := fileData{
 		Version:        fileVersion,
-		PricingSource:  pricingSource,
+		PricingSource:  PricingSource,
 		PricingVersion: PricingVersion,
 		UpdatedAt:      formatTime(p.updatedAt),
 		DroppedEvents:  p.droppedEvents.Load(),
 		Accounts:       make(map[string]AccountStats, len(p.accounts)),
 	}
 	for key, account := range p.accounts {
-		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
-		data.Accounts[key] = account
+		data.Accounts[key] = accountForOutput(account)
 	}
 	p.mu.RUnlock()
 	if err := os.MkdirAll(filepath.Dir(p.path), 0o755); err != nil {
@@ -471,7 +590,7 @@ func (p *PersistentUsagePlugin) load() {
 		if ts, errParse := time.Parse(time.RFC3339, account.LastRequestedAt); errParse == nil {
 			account.lastRequestedAtTimeUTC = ts.UTC()
 		}
-		account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
+		account = accountForOutput(account)
 		if account.AuthIndex != "" {
 			p.accounts[account.AuthIndex] = account
 		}
@@ -494,13 +613,28 @@ func (p *PersistentUsagePlugin) pricingMissingCountLocked() int64 {
 	return total
 }
 
+func accountForOutput(account AccountStats) AccountStats {
+	account.EstimatedCostUSD = FormatUSD(account.EstimatedCostNanoUSD)
+	if account.FullQuotaEstimatedNanoUSD > 0 {
+		account.FullQuotaEstimatedUSD = FormatUSD(account.FullQuotaEstimatedNanoUSD)
+	} else {
+		account.FullQuotaEstimatedUSD = ""
+	}
+	return account
+}
+
+func isFinitePercent(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
+}
+
 // EventFromRecord applies the fixed inclusion rule for this feature.
 func EventFromRecord(record coreusage.Record) (Event, bool) {
-	provider := strings.ToLower(strings.TrimSpace(record.Provider))
-	if provider != "codex" && provider != "openai" {
+	provider := normalizeUsageProvider(record.Provider)
+	if !isOpenAIUsageProvider(provider) {
 		return Event{}, false
 	}
-	if !strings.EqualFold(strings.TrimSpace(record.AuthType), "oauth") {
+	authType := normalizeUsageAuthType(record.AuthType)
+	if authType != "oauth" && authType != "apikey" {
 		return Event{}, false
 	}
 	authIndex := strings.TrimSpace(record.AuthIndex)
@@ -508,10 +642,18 @@ func EventFromRecord(record coreusage.Record) (Event, bool) {
 		return Event{}, false
 	}
 	fileName := strings.TrimSpace(record.AuthFileName)
-	if fileName == "" || !strings.HasSuffix(strings.ToLower(fileName), ".json") {
-		return Event{}, false
+	if fileName != "" {
+		fileName = filepath.Base(fileName)
 	}
-	fileName = filepath.Base(fileName)
+	displayName := fileName
+	if authType == "oauth" {
+		if fileName == "" || !strings.HasSuffix(strings.ToLower(fileName), ".json") {
+			return Event{}, false
+		}
+	} else {
+		displayName = apiKeyDisplayName(authIndex)
+		fileName = displayName
+	}
 	detail := record.Detail
 	cacheRead := detail.CacheReadTokens
 	if cacheRead == 0 {
@@ -520,6 +662,9 @@ func EventFromRecord(record coreusage.Record) (Event, bool) {
 	return Event{
 		AuthIndex:           authIndex,
 		AuthFileName:        fileName,
+		DisplayName:         displayName,
+		Provider:            provider,
+		AuthType:            authType,
 		AccountEmail:        strings.TrimSpace(record.AccountEmail),
 		Model:               strings.TrimSpace(record.Model),
 		ServiceTier:         strings.TrimSpace(record.ServiceTier),
@@ -534,160 +679,6 @@ func EventFromRecord(record coreusage.Record) (Event, bool) {
 		ReasoningTokens:     detail.ReasoningTokens,
 		TotalTokens:         detail.TotalTokens,
 	}, true
-}
-
-type modelPrice struct {
-	Short modelTierPrices
-	Long  *modelTierPrices
-}
-
-type modelTierPrices struct {
-	ThresholdTokens int64
-	Tiers           map[string]tierPrice
-}
-
-type tierPrice struct {
-	InputNanoUSDPerToken      int64
-	CachedNanoUSDPerToken     int64
-	OutputNanoUSDPerToken     int64
-	CacheWriteNanoUSDPerToken *int64
-}
-
-var priceTable = map[string]modelPrice{
-	"gpt-5.5": {
-		Short: modelTierPrices{
-			Tiers: map[string]tierPrice{
-				"default":  pricePerMillion("5.000", "0.500", "30.000"),
-				"priority": pricePerMillion("12.500", "1.250", "75.000"),
-				"batch":    pricePerMillion("2.500", "0.250", "15.000"),
-				"flex":     pricePerMillion("2.500", "0.250", "15.000"),
-			},
-		},
-		Long: &modelTierPrices{
-			ThresholdTokens: 272000,
-			Tiers: map[string]tierPrice{
-				"default": pricePerMillion("10.000", "1.000", "45.000"),
-				"batch":   pricePerMillion("5.000", "0.500", "22.500"),
-				"flex":    pricePerMillion("5.000", "0.500", "22.500"),
-			},
-		},
-	},
-}
-
-// Price calculates equivalent API estimated cost in nano-USD.
-func Price(event Event) (int64, bool) {
-	if !event.UsageReported {
-		return 0, false
-	}
-	canonical := CanonicalModel(event.Model)
-	model, ok := priceTable[canonical]
-	if !ok {
-		return 0, false
-	}
-	tierName := finalTier(event)
-	prices := model.Short
-	if model.Long != nil && event.InputTokens >= model.Long.ThresholdTokens {
-		if _, okTier := model.Long.Tiers[tierName]; !okTier {
-			return 0, false
-		}
-		prices = *model.Long
-	}
-	price, ok := prices.Tiers[tierName]
-	if !ok {
-		return 0, false
-	}
-	cacheRead := event.CachedInputTokens
-	if cacheRead < 0 {
-		cacheRead = 0
-	}
-	cacheCreation := event.CacheCreationTokens
-	if cacheCreation < 0 {
-		cacheCreation = 0
-	}
-	regularInput := event.InputTokens - cacheRead - cacheCreation
-	if regularInput < 0 {
-		regularInput = 0
-	}
-	cost := regularInput*price.InputNanoUSDPerToken +
-		cacheRead*price.CachedNanoUSDPerToken +
-		event.OutputTokens*price.OutputNanoUSDPerToken
-	if cacheCreation > 0 {
-		if price.CacheWriteNanoUSDPerToken != nil {
-			cost += cacheCreation * *price.CacheWriteNanoUSDPerToken
-		} else {
-			cost += cacheCreation * price.InputNanoUSDPerToken
-		}
-	}
-	return cost, true
-}
-
-func finalTier(event Event) string {
-	if strings.TrimSpace(event.ResponseServiceTier) != "" {
-		return normalizeTier(event.ResponseServiceTier)
-	}
-	return normalizeTier(event.ServiceTier)
-}
-
-func normalizeTier(tier string) string {
-	switch strings.ToLower(strings.TrimSpace(tier)) {
-	case "", "auto", "standard", "default":
-		return "default"
-	case "priority":
-		return "priority"
-	case "batch":
-		return "batch"
-	case "flex":
-		return "flex"
-	default:
-		return "default"
-	}
-}
-
-var dateSuffixPattern = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)
-
-// CanonicalModel normalizes only exact supported OpenAI model naming variants.
-func CanonicalModel(model string) string {
-	current := strings.ToLower(strings.TrimSpace(model))
-	for i := 0; i < 4; i++ {
-		next := canonicalModelStep(current)
-		if next == current {
-			break
-		}
-		current = next
-	}
-	return current
-}
-
-func canonicalModelStep(model string) string {
-	model = strings.TrimSpace(model)
-	if slash := strings.LastIndex(model, "/"); slash >= 0 && slash < len(model)-1 {
-		model = strings.TrimSpace(model[slash+1:])
-	}
-	if idx := strings.Index(model, "("); idx > 0 && strings.HasSuffix(model, ")") {
-		model = strings.TrimSpace(model[:idx])
-	}
-	model = dateSuffixPattern.ReplaceAllString(model, "")
-	return model
-}
-
-func pricePerMillion(input, cached, output string) tierPrice {
-	return tierPrice{
-		InputNanoUSDPerToken:  decimalUSDPerMillionToNano(input),
-		CachedNanoUSDPerToken: decimalUSDPerMillionToNano(cached),
-		OutputNanoUSDPerToken: decimalUSDPerMillionToNano(output),
-	}
-}
-
-func decimalUSDPerMillionToNano(value string) int64 {
-	rat, ok := new(big.Rat).SetString(strings.TrimSpace(value))
-	if !ok {
-		return 0
-	}
-	rat.Mul(rat, big.NewRat(1_000_000_000, 1_000_000))
-	num := new(big.Int).Set(rat.Num())
-	den := new(big.Int).Set(rat.Denom())
-	num.Add(num, new(big.Int).Div(den, big.NewInt(2)))
-	return new(big.Int).Quo(num, den).Int64()
 }
 
 // FormatUSD formats nano-USD as a decimal USD string.

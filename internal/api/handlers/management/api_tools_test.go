@@ -3,10 +3,13 @@ package management
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -27,6 +30,48 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAntigravityOAuthClientCredentialsPreferMetadata(t *testing.T) {
+	t.Setenv(antigravityOAuthClientIDEnv, "env-client-id")
+	t.Setenv(antigravityOAuthClientSecretEnv, "env-client-secret")
+
+	clientID, clientSecret, err := antigravityOAuthClientCredentials(map[string]any{
+		"client_id":     " metadata-client-id ",
+		"client_secret": " metadata-client-secret ",
+	})
+	if err != nil {
+		t.Fatalf("credentials error: %v", err)
+	}
+	if clientID != "metadata-client-id" || clientSecret != "metadata-client-secret" {
+		t.Fatalf("credentials = %q/%q, want metadata values", clientID, clientSecret)
+	}
+}
+
+func TestAntigravityOAuthClientCredentialsUseEnv(t *testing.T) {
+	t.Setenv(antigravityOAuthClientIDEnv, "env-client-id")
+	t.Setenv(antigravityOAuthClientSecretEnv, "env-client-secret")
+
+	clientID, clientSecret, err := antigravityOAuthClientCredentials(nil)
+	if err != nil {
+		t.Fatalf("credentials error: %v", err)
+	}
+	if clientID != "env-client-id" || clientSecret != "env-client-secret" {
+		t.Fatalf("credentials = %q/%q, want env values", clientID, clientSecret)
+	}
+}
+
+func TestAntigravityOAuthClientCredentialsRequireBoth(t *testing.T) {
+	t.Setenv(antigravityOAuthClientIDEnv, "")
+	t.Setenv(antigravityOAuthClientSecretEnv, "")
+
+	_, _, err := antigravityOAuthClientCredentials(map[string]any{"client_id": "metadata-client-id"})
+	if err == nil {
+		t.Fatal("expected missing credentials error")
+	}
+	if !strings.Contains(err.Error(), antigravityOAuthClientSecretEnv) {
+		t.Fatalf("error = %q, want missing secret env hint", err.Error())
 	}
 }
 
@@ -137,6 +182,224 @@ func TestMarkInvalidAuthFromAPICallRequiresExactTokenInvalidError(t *testing.T) 
 	}
 }
 
+func TestRecordOpenAIQuotaSampleFromAPICallRequiresExactCodexUsageURL(t *testing.T) {
+	t.Parallel()
+
+	auth := &coreauth.Auth{
+		ID:       "codex-oauth",
+		Provider: "codex",
+		FileName: "codex-user.json",
+		Attributes: map[string]string{
+			coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
+			"email":                    "user@example.com",
+		},
+	}
+	auth.EnsureIndex()
+	store := &quotaRecorderStore{}
+	h := &Handler{openAIUsageStore: store}
+	usageURL := mustParseURLForTest(t, "https://chatgpt.com/backend-api/wham/usage")
+
+	h.recordOpenAIQuotaSampleFromAPICall(context.Background(), auth, usageURL, http.StatusOK, []byte(`{
+		"rate_limit": {
+			"secondary_window": {
+				"used_percent": 12.345,
+				"limit_window_seconds": 2592000
+			}
+		}
+	}`))
+	if len(store.samples) != 1 {
+		t.Fatalf("samples = %d, want 1", len(store.samples))
+	}
+	sample := store.samples[0]
+	if sample.AuthIndex != auth.Index || sample.AuthFileName != "codex-user.json" || sample.Provider != "codex" || sample.AuthType != coreauth.AuthKindOAuth {
+		t.Fatalf("sample identity = %+v", sample)
+	}
+	if sample.WindowID != "monthly" || sample.UsedPercent != 12.345 || sample.AccountEmail != "user@example.com" {
+		t.Fatalf("sample quota = %+v", sample)
+	}
+
+	blockedCases := []struct {
+		name       string
+		auth       *coreauth.Auth
+		url        string
+		statusCode int
+		body       string
+	}{
+		{name: "ordinary url", auth: auth, url: "https://chatgpt.com/backend-api/other", statusCode: http.StatusOK, body: `{"rate_limit":{"secondary_window":{"used_percent":20}}}`},
+		{name: "401", auth: auth, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusUnauthorized, body: `{"rate_limit":{"secondary_window":{"used_percent":20}}}`},
+		{name: "403", auth: auth, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusForbidden, body: `{"rate_limit":{"secondary_window":{"used_percent":20}}}`},
+		{name: "api key", auth: &coreauth.Auth{Provider: "codex", FileName: "codex-api-key.json", Attributes: map[string]string{coreauth.AttributeAPIKey: "sk-test"}}, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusOK, body: `{"rate_limit":{"secondary_window":{"used_percent":20}}}`},
+		{name: "non codex provider", auth: &coreauth.Auth{Provider: "gemini", FileName: "gemini.json", Attributes: map[string]string{coreauth.AttributeAuthKind: coreauth.AuthKindOAuth}}, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusOK, body: `{"rate_limit":{"secondary_window":{"used_percent":20}}}`},
+		{name: "five hour primary only", auth: auth, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusOK, body: `{"rate_limit":{"primary_window":{"used_percent":20}}}`},
+		{name: "unsupported secondary window", auth: auth, url: "https://chatgpt.com/backend-api/wham/usage", statusCode: http.StatusOK, body: `{"rate_limit":{"secondary_window":{"used_percent":20,"limit_window_seconds":3600}}}`},
+	}
+	for _, tt := range blockedCases {
+		t.Run(tt.name, func(t *testing.T) {
+			store.samples = nil
+			h.recordOpenAIQuotaSampleFromAPICall(context.Background(), tt.auth, mustParseURLForTest(t, tt.url), tt.statusCode, []byte(tt.body))
+			if len(store.samples) != 0 {
+				t.Fatalf("samples = %+v, want none", store.samples)
+			}
+		})
+	}
+}
+
+func TestRecordOpenAIQuotaSampleFromAPICallAcceptsCamelCaseWeeklyFallback(t *testing.T) {
+	t.Parallel()
+
+	auth := &coreauth.Auth{
+		ID:       "openai-oauth",
+		Provider: "openai",
+		FileName: "openai-user.json",
+		Attributes: map[string]string{
+			coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
+		},
+	}
+	auth.EnsureIndex()
+	store := &quotaRecorderStore{}
+	h := &Handler{openAIUsageStore: store}
+	h.recordOpenAIQuotaSampleFromAPICall(context.Background(), auth, mustParseURLForTest(t, "https://chatgpt.com/backend-api/wham/usage"), http.StatusOK, []byte(`{
+		"rateLimit": {
+			"secondaryWindow": {
+				"usedPercent": 3.5
+			}
+		}
+	}`))
+	if len(store.samples) != 1 {
+		t.Fatalf("samples = %d, want 1", len(store.samples))
+	}
+	if store.samples[0].WindowID != "weekly" || store.samples[0].UsedPercent != 3.5 {
+		t.Fatalf("sample = %+v, want weekly 3.5", store.samples[0])
+	}
+}
+
+func TestRecordOpenAIQuotaSampleFromAPICallSelectsMainQuotaWindowBySeconds(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "codex-oauth",
+		Provider: "codex",
+		FileName: "codex-user.json",
+		Attributes: map[string]string{
+			coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
+		},
+	}
+	auth.EnsureIndex()
+	usageURL := mustParseURLForTest(t, "https://chatgpt.com/backend-api/wham/usage")
+
+	tests := []struct {
+		name        string
+		body        string
+		wantSample  bool
+		wantWindow  string
+		wantPercent float64
+	}{
+		{
+			name: "primary five hour secondary weekly",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":1,"limit_window_seconds":18000},
+				"secondary_window":{"used_percent":7.25,"limit_window_seconds":604800}
+			}}`,
+			wantSample:  true,
+			wantWindow:  "weekly",
+			wantPercent: 7.25,
+		},
+		{
+			name: "primary weekly secondary five hour",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":8.5,"limit_window_seconds":604800},
+				"secondary_window":{"used_percent":2,"limit_window_seconds":18000}
+			}}`,
+			wantSample:  true,
+			wantWindow:  "weekly",
+			wantPercent: 8.5,
+		},
+		{
+			name: "primary five hour secondary monthly",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":3,"limit_window_seconds":18000},
+				"secondary_window":{"used_percent":33.3,"limit_window_seconds":2592000}
+			}}`,
+			wantSample:  true,
+			wantWindow:  "monthly",
+			wantPercent: 33.3,
+		},
+		{
+			name: "camel case primary and secondary",
+			body: `{"rateLimit":{
+				"primaryWindow":{"usedPercent":4,"limitWindowSeconds":18000},
+				"secondaryWindow":{"usedPercent":9.75,"limitWindowSeconds":604800}
+			}}`,
+			wantSample:  true,
+			wantWindow:  "weekly",
+			wantPercent: 9.75,
+		},
+		{
+			name: "missing seconds fallback to secondary weekly",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":1},
+				"secondary_window":{"used_percent":12.5}
+			}}`,
+			wantSample:  true,
+			wantWindow:  "weekly",
+			wantPercent: 12.5,
+		},
+		{
+			name: "only primary missing seconds ignored",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":1}
+			}}`,
+		},
+		{
+			name: "code review weekly ignored",
+			body: `{
+				"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000}},
+				"code_review_rate_limit":{"secondary_window":{"used_percent":44,"limit_window_seconds":604800}}
+			}`,
+		},
+		{
+			name: "additional weekly ignored",
+			body: `{
+				"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000}},
+				"additional_rate_limits":[{"rate_limit":{"secondary_window":{"used_percent":55,"limit_window_seconds":604800}}}]
+			}`,
+		},
+		{
+			name: "weekly without used percent does not fallback to monthly",
+			body: `{"rate_limit":{
+				"primary_window":{"limit_window_seconds":604800},
+				"secondary_window":{"used_percent":33,"limit_window_seconds":2592000}
+			}}`,
+		},
+		{
+			name: "five hour window ignored",
+			body: `{"rate_limit":{
+				"primary_window":{"used_percent":1,"limit_window_seconds":18000},
+				"secondary_window":{"used_percent":2,"limit_window_seconds":18000}
+			}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &quotaRecorderStore{}
+			h := &Handler{openAIUsageStore: store}
+			h.recordOpenAIQuotaSampleFromAPICall(context.Background(), auth, usageURL, http.StatusOK, []byte(tt.body))
+			if !tt.wantSample {
+				if len(store.samples) != 0 {
+					t.Fatalf("samples = %+v, want none", store.samples)
+				}
+				return
+			}
+			if len(store.samples) != 1 {
+				t.Fatalf("samples = %d, want 1", len(store.samples))
+			}
+			sample := store.samples[0]
+			if sample.WindowID != tt.wantWindow || sample.UsedPercent != tt.wantPercent {
+				t.Fatalf("sample = %+v, want %s %.4f", sample, tt.wantWindow, tt.wantPercent)
+			}
+		})
+	}
+}
+
 func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 	t.Parallel()
 
@@ -164,6 +427,32 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
 		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
 	}
+}
+
+type quotaRecorderStore struct {
+	samples []openaiusage.QuotaSample
+}
+
+func (s *quotaRecorderStore) Status() openaiusage.StatusResponse { return openaiusage.StatusResponse{} }
+
+func (s *quotaRecorderStore) Accounts() []openaiusage.AccountStats { return nil }
+
+func (s *quotaRecorderStore) Account(string) (openaiusage.AccountStats, bool) {
+	return openaiusage.AccountStats{}, false
+}
+
+func (s *quotaRecorderStore) RecordQuotaSample(_ context.Context, sample openaiusage.QuotaSample) error {
+	s.samples = append(s.samples, sample)
+	return nil
+}
+
+func mustParseURLForTest(t *testing.T, rawURL string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse url %q: %v", rawURL, err)
+	}
+	return parsed
 }
 
 func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {

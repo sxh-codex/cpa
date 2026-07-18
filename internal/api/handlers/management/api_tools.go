@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -21,8 +25,8 @@ import (
 const defaultAPICallTimeout = 60 * time.Second
 
 const (
-	antigravityOAuthClientID     = "ANTIGRAVITY_GOOGLE_OAUTH_CLIENT_ID_PLACEHOLDER"
-	antigravityOAuthClientSecret = "ANTIGRAVITY_GOOGLE_OAUTH_CLIENT_SECRET_PLACEHOLDER"
+	antigravityOAuthClientIDEnv     = "ANTIGRAVITY_OAUTH_CLIENT_ID"
+	antigravityOAuthClientSecretEnv = "ANTIGRAVITY_OAUTH_CLIENT_SECRET"
 )
 
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
@@ -197,6 +201,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 
 	h.markInvalidAuthFromAPICall(c.Request.Context(), auth, resp.StatusCode, respBody)
+	h.recordOpenAIQuotaSampleFromAPICall(c.Request.Context(), auth, parsedURL, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -235,6 +240,160 @@ func (h *Handler) markInvalidAuthFromAPICall(ctx context.Context, auth *coreauth
 	if _, errUpdate := h.authManager.Update(ctx, updated); errUpdate != nil {
 		log.WithError(errUpdate).Debug("failed to mark invalid auth from management APICall")
 	}
+}
+
+func (h *Handler) recordOpenAIQuotaSampleFromAPICall(ctx context.Context, auth *coreauth.Auth, requestedURL *url.URL, statusCode int, respBody []byte) {
+	if h == nil || auth == nil || requestedURL == nil || statusCode < 200 || statusCode >= 300 {
+		return
+	}
+	if !strings.EqualFold(requestedURL.Hostname(), "chatgpt.com") || requestedURL.EscapedPath() != "/backend-api/wham/usage" {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider != "codex" && provider != "openai" {
+		return
+	}
+	authType := auth.AuthKind()
+	if authType != coreauth.AuthKindOAuth {
+		return
+	}
+	authIndex := strings.TrimSpace(auth.EnsureIndex())
+	if authIndex == "" {
+		return
+	}
+	fileName := openAIUsageAuthFileName(auth)
+	if fileName == "" {
+		return
+	}
+	windowID, usedPercent, ok := quotaSampleWindowFromUsageResponse(respBody)
+	if !ok {
+		return
+	}
+	store := h.openAIUsageStoreSnapshot()
+	recorder, ok := store.(openaiusage.QuotaSampleRecorder)
+	if !ok || recorder == nil {
+		return
+	}
+	if err := recorder.RecordQuotaSample(ctx, openaiusage.QuotaSample{
+		AuthIndex:    authIndex,
+		AuthFileName: fileName,
+		DisplayName:  fileName,
+		Provider:     provider,
+		AuthType:     authType,
+		AccountEmail: authEmail(auth),
+		WindowID:     windowID,
+		UsedPercent:  usedPercent,
+		SampledAt:    time.Now().UTC(),
+	}); err != nil {
+		log.WithError(err).Warn("failed to record OpenAI quota sample from management APICall")
+	}
+}
+
+func quotaSampleWindowFromUsageResponse(respBody []byte) (string, float64, bool) {
+	rateLimit := gjson.GetBytes(respBody, "rate_limit")
+	if !rateLimit.Exists() {
+		rateLimit = gjson.GetBytes(respBody, "rateLimit")
+	}
+	if !rateLimit.Exists() {
+		return "", 0, false
+	}
+
+	candidates := []quotaSampleWindowCandidate{
+		{window: rateLimit.Get("primary_window")},
+		{window: rateLimit.Get("primaryWindow")},
+		{window: rateLimit.Get("secondary_window"), secondary: true},
+		{window: rateLimit.Get("secondaryWindow"), secondary: true},
+	}
+	var weekly *quotaSampleWindowCandidate
+	var monthly *quotaSampleWindowCandidate
+	sawWindowSeconds := false
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !candidate.window.Exists() {
+			continue
+		}
+		secondsValue := quotaSampleWindowSeconds(candidate.window)
+		if !secondsValue.Exists() {
+			continue
+		}
+		sawWindowSeconds = true
+		seconds := secondsValue.Int()
+		switch {
+		case seconds == 604800:
+			if weekly == nil {
+				weekly = candidate
+			}
+		case seconds >= 28*24*60*60 && seconds <= 31*24*60*60:
+			if monthly == nil {
+				monthly = candidate
+			}
+		}
+	}
+	if weekly != nil {
+		if usedPercent, ok := quotaSampleUsedPercent(weekly.window); ok {
+			return "weekly", usedPercent, true
+		}
+		return "", 0, false
+	}
+	if monthly != nil {
+		if usedPercent, ok := quotaSampleUsedPercent(monthly.window); ok {
+			return "monthly", usedPercent, true
+		}
+		return "", 0, false
+	}
+	if sawWindowSeconds {
+		return "", 0, false
+	}
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !candidate.secondary || !candidate.window.Exists() {
+			continue
+		}
+		if usedPercent, ok := quotaSampleUsedPercent(candidate.window); ok {
+			return "weekly", usedPercent, true
+		}
+	}
+	return "", 0, false
+}
+
+type quotaSampleWindowCandidate struct {
+	window    gjson.Result
+	secondary bool
+}
+
+func quotaSampleWindowSeconds(window gjson.Result) gjson.Result {
+	seconds := window.Get("limit_window_seconds")
+	if seconds.Exists() {
+		return seconds
+	}
+	return window.Get("limitWindowSeconds")
+}
+
+func quotaSampleUsedPercent(window gjson.Result) (float64, bool) {
+	usedPercent := window.Get("used_percent")
+	if !usedPercent.Exists() {
+		usedPercent = window.Get("usedPercent")
+	}
+	if !usedPercent.Exists() {
+		return 0, false
+	}
+	var value float64
+	switch usedPercent.Type {
+	case gjson.Number:
+		value = usedPercent.Float()
+	case gjson.String:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(usedPercent.String()), 64)
+		if err != nil {
+			return 0, false
+		}
+		value = parsed
+	default:
+		return 0, false
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
 }
 
 func matchesInvalidAuthResponse(statusCode int, respBody []byte) bool {
@@ -332,9 +491,13 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	if tokenURL == "" {
 		tokenURL = "https://oauth2.googleapis.com/token"
 	}
+	clientID, clientSecret, errCredentials := antigravityOAuthClientCredentials(metadata)
+	if errCredentials != nil {
+		return "", errCredentials
+	}
 	form := url.Values{}
-	form.Set("client_id", antigravityOAuthClientID)
-	form.Set("client_secret", antigravityOAuthClientSecret)
+	form.Set("client_id", clientID)
+	form.Set("client_secret", clientSecret)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 
@@ -468,6 +631,35 @@ func stringValue(metadata map[string]any, key string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+func antigravityOAuthClientCredentials(metadata map[string]any) (string, string, error) {
+	clientID := strings.TrimSpace(stringValue(metadata, "client_id"))
+	if clientID == "" {
+		clientID = strings.TrimSpace(stringValue(metadata, "clientId"))
+	}
+	if clientID == "" {
+		clientID = strings.TrimSpace(stringValue(metadata, "oauth_client_id"))
+	}
+	if clientID == "" {
+		clientID = strings.TrimSpace(os.Getenv(antigravityOAuthClientIDEnv))
+	}
+
+	clientSecret := strings.TrimSpace(stringValue(metadata, "client_secret"))
+	if clientSecret == "" {
+		clientSecret = strings.TrimSpace(stringValue(metadata, "clientSecret"))
+	}
+	if clientSecret == "" {
+		clientSecret = strings.TrimSpace(stringValue(metadata, "oauth_client_secret"))
+	}
+	if clientSecret == "" {
+		clientSecret = strings.TrimSpace(os.Getenv(antigravityOAuthClientSecretEnv))
+	}
+
+	if clientID == "" || clientSecret == "" {
+		return "", "", fmt.Errorf("antigravity oauth client credentials missing: set metadata client_id/client_secret or %s/%s", antigravityOAuthClientIDEnv, antigravityOAuthClientSecretEnv)
+	}
+	return clientID, clientSecret, nil
 }
 
 func tokenValueFromMetadata(metadata map[string]any) string {

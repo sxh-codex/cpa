@@ -15,7 +15,7 @@ func (h *Handler) GetOpenAIUsageStatus(c *gin.Context) {
 			Enabled:        false,
 			QueueLimit:     openaiusage.QueueLimit,
 			BatchSize:      openaiusage.MaxBatchSize,
-			PricingSource:  "OpenAI API pricing page https://developers.openai.com/api/docs/pricing checked 2026-07-14",
+			PricingSource:  openaiusage.PricingSource,
 			PricingVersion: openaiusage.PricingVersion,
 		})
 		return

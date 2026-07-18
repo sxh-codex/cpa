@@ -475,7 +475,8 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	usageStats, hasOpenAIUsage := h.openAIUsageForAuth(auth)
+	if path == "" && !runtimeOnly && !hasOpenAIUsage {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -500,7 +501,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
-	if usageStats, ok := h.openAIUsageForAuth(auth); ok {
+	if hasOpenAIUsage {
 		entry["openai_usage"] = usageStats
 	}
 	if email := authEmail(auth); email != "" {
@@ -514,7 +515,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["account_type"] = accountType
 		}
 		if account != "" {
-			entry["account"] = account
+			if accountType == "api_key" {
+				entry["account"] = openAIUsageAPIKeyDisplayName(auth.Index)
+			} else {
+				entry["account"] = account
+			}
 		}
 	}
 	if !auth.CreatedAt.IsZero() {
@@ -590,29 +595,49 @@ func (h *Handler) openAIUsageForAuth(auth *coreauth.Auth) (openaiusage.AccountSt
 	if auth == nil {
 		return openaiusage.AccountStats{}, false
 	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if provider != "codex" && provider != "openai" {
+	provider := openAIUsageProviderForAuth(auth)
+	if provider == "" {
 		return openaiusage.AccountStats{}, false
 	}
-	if auth.AuthKind() != coreauth.AuthKindOAuth {
-		return openaiusage.AccountStats{}, false
-	}
-	fileName := openAIUsageAuthFileName(auth)
-	if fileName == "" {
+	authKind := auth.AuthKind()
+	if authKind != coreauth.AuthKindOAuth && authKind != coreauth.AuthKindAPIKey {
 		return openaiusage.AccountStats{}, false
 	}
 	authIndex := strings.TrimSpace(auth.EnsureIndex())
 	if authIndex == "" {
 		return openaiusage.AccountStats{}, false
 	}
+	fileName := ""
+	displayName := ""
+	if authKind == coreauth.AuthKindOAuth {
+		fileName = openAIUsageAuthFileName(auth)
+		if fileName == "" {
+			return openaiusage.AccountStats{}, false
+		}
+		displayName = fileName
+	} else {
+		displayName = openAIUsageAPIKeyDisplayName(authIndex)
+		fileName = displayName
+	}
 	store := h.openAIUsageStoreSnapshot()
 	if store == nil {
-		return zeroOpenAIUsageStats(auth, authIndex, fileName), true
+		return zeroOpenAIUsageStats(auth, authIndex, fileName, displayName, provider, authKind), true
 	}
 	if stats, ok := store.Account(authIndex); ok {
 		return stats, true
 	}
-	return zeroOpenAIUsageStats(auth, authIndex, fileName), true
+	return zeroOpenAIUsageStats(auth, authIndex, fileName, displayName, provider, authKind), true
+}
+
+func openAIUsageProviderForAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "codex" || provider == "openai" || provider == "openai-compatibility" || strings.HasPrefix(provider, "openai-compatible-") {
+		return provider
+	}
+	return ""
 }
 
 func openAIUsageAuthFileName(auth *coreauth.Auth) string {
@@ -636,17 +661,31 @@ func openAIUsageAuthFileName(auth *coreauth.Auth) string {
 	return ""
 }
 
-func zeroOpenAIUsageStats(auth *coreauth.Auth, authIndex string, fileName string) openaiusage.AccountStats {
+func zeroOpenAIUsageStats(auth *coreauth.Auth, authIndex string, fileName string, displayName string, provider string, authKind string) openaiusage.AccountStats {
 	if auth == nil {
 		return openaiusage.AccountStats{}
 	}
 	return openaiusage.AccountStats{
 		AuthIndex:            authIndex,
 		AuthFileName:         strings.TrimSpace(fileName),
+		DisplayName:          strings.TrimSpace(displayName),
+		Provider:             strings.TrimSpace(provider),
+		AuthType:             strings.TrimSpace(authKind),
 		AccountEmail:         authEmail(auth),
 		EstimatedCostNanoUSD: 0,
 		EstimatedCostUSD:     openaiusage.FormatUSD(0),
 	}
+}
+
+func openAIUsageAPIKeyDisplayName(authIndex string) string {
+	authIndex = strings.TrimSpace(authIndex)
+	if len(authIndex) > 8 {
+		authIndex = authIndex[:8]
+	}
+	if authIndex == "" {
+		return "api-key"
+	}
+	return "api-key:" + authIndex
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {

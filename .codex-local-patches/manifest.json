@@ -1,43 +1,81 @@
 {
-    "upstream_version":  "v7.2.80",
-    "upstream_source":  "E:\\CLIProxyAPI\\.codex-upstream\\v7.2.80-src-20260716-210653\\CLIProxyAPI-7.2.80",
-    "generated_at":  "2026-07-16T16:31:50Z",
-    "changed_files":  [
-                          "internal/api/handlers/management/api_tools.go",
-                          "internal/api/handlers/management/api_tools_test.go",
-                          "internal/api/handlers/management/auth_files.go",
-                          "internal/api/handlers/management/auth_files_delete_test.go",
-                          "internal/api/handlers/management/auth_files_openai_usage_test.go",
-                          "internal/api/handlers/management/handler.go",
-                          "internal/api/handlers/management/openai_usage.go",
-                          "internal/api/handlers/management/openai_usage_test.go",
-                          "internal/api/server.go",
-                          "internal/openaiusage/store.go",
-                          "internal/openaiusage/store_test.go",
-                          "internal/runtime/executor/helps/usage_helpers.go",
-                          "sdk/api/handlers/openai/openai_responses_websocket.go",
-                          "sdk/api/handlers/openai/openai_responses_websocket_test.go",
-                          "sdk/cliproxy/auth/conductor.go",
-                          "sdk/cliproxy/auth/conductor_invalid_workspace_test.go",
-                          "sdk/cliproxy/auth/conductor_scheduler_refresh_test.go",
-                          "sdk/cliproxy/auth/cooldown_backoff_test.go",
-                          "sdk/cliproxy/auth/error_events_test.go",
-                          "sdk/cliproxy/auth/scheduler_test.go",
-                          "sdk/cliproxy/service.go",
-                          "sdk/cliproxy/usage/manager.go",
-                          "sdk/cliproxy/usage/manager_test.go",
-                          "static/management.html"
-                      ],
-    "patches":  [
-                    {
-                        "file":  "001-backend-local-customizations.patch",
-                        "size":  144015,
-                        "sha256":  "C3EA8530052715E9152C561A5B96F0F3672185956B05F384508C00F267B6AC71"
-                    },
-                    {
-                        "file":  "002-management-panel-local-ui.patch",
-                        "size":  2562574,
-                        "sha256":  "4205EBE33F0A16C3A765E84483643BF8CC15C98667ED94E4F94C9D07F50EC5F4"
-                    }
-                ]
+  "upstream_version": "v7.2.80",
+  "generated_at": "2026-07-19T00:05:42+08:00",
+  "github_sync": {
+    "repo": "sxh-codex/cpa",
+    "commit": "8375fa3256f3d3cddc804fd4972c3de39a080845",
+    "mode": "source-only",
+    "excluded": [
+      "config.yaml",
+      "auths",
+      "auth JSON files",
+      "runtime data",
+      "logs",
+      "caches",
+      "build output"
+    ]
+  },
+  "changed_files": [
+    "internal/api/handlers/management/api_tools.go",
+    "internal/api/handlers/management/api_tools_test.go",
+    "internal/api/handlers/management/auth_files.go",
+    "internal/api/handlers/management/auth_files_delete_test.go",
+    "internal/api/handlers/management/auth_files_openai_usage_test.go",
+    "internal/api/handlers/management/handler.go",
+    "internal/api/handlers/management/openai_usage.go",
+    "internal/api/handlers/management/openai_usage_test.go",
+    "internal/api/server.go",
+    "internal/openaiusage/model_prices_and_context_window.json",
+    "internal/openaiusage/pricing.go",
+    "internal/openaiusage/store.go",
+    "internal/openaiusage/store_test.go",
+    "internal/runtime/executor/helps/usage_helpers.go",
+    "internal/runtime/executor/helps/usage_helpers_test.go",
+    "sdk/api/handlers/openai/openai_responses_websocket.go",
+    "sdk/api/handlers/openai/openai_responses_websocket_test.go",
+    "sdk/cliproxy/auth/conductor.go",
+    "sdk/cliproxy/auth/conductor_invalid_workspace_test.go",
+    "sdk/cliproxy/auth/conductor_scheduler_refresh_test.go",
+    "sdk/cliproxy/auth/cooldown_backoff_test.go",
+    "sdk/cliproxy/auth/error_events_test.go",
+    "sdk/cliproxy/auth/scheduler_test.go",
+    "sdk/cliproxy/service.go",
+    "sdk/cliproxy/usage/manager.go",
+    "sdk/cliproxy/usage/manager_test.go",
+    "static/management.html"
+  ],
+  "patches": [
+    {
+      "file": "001-backend-local-customizations.patch",
+      "size": 393550,
+      "sha256": "EE96C100714550A09DB6A00548F1092A2F8A5E955A7AEACA5E1794C1D800C58E",
+      "description": "Backend, tests, OpenAI usage accounting, Sub2API pricing, auth status/removal, 429 cooldown, usage manager lifecycle"
+    },
+    {
+      "file": "002-management-panel-local-ui.patch",
+      "size": 2583146,
+      "sha256": "528959E5747FE0E66BC7D0640EC39F1638FCD52824FE4D08F3A5A3977535C59F",
+      "description": "Restores ignored static/management.html with local panel UI customizations"
+    }
+  ],
+  "validation": {
+    "patch_cached_check": "passed 2026-07-19",
+    "patch_windows_whitespace_check": "passed 2026-07-19 against .codex-sync\\patch-check-v7.2.80-20260717-015109",
+    "targeted_tests": "not rerun during 2026-07-19 record correction; subthread reported targeted api_tools_test.go check passed",
+    "full_tests": "not rerun during 2026-07-19 record correction",
+    "build": "not rebuilt during 2026-07-19 record correction; existing build artifact recorded"
+  },
+  "build_artifact": {
+    "path": "E:\\CLIProxyAPI\\build-output\\cli-proxy-api.exe",
+    "version": "v7.2.80",
+    "commit": "unknown",
+    "built_at": "2026-07-18T23:13:55+08:00",
+    "size": 62224384,
+    "sha256": "F58C75DB0694A844442E873C6ABD96750D5E1AA3400B05BB15215E29477A3A27"
+  },
+  "protected_paths_not_modified": [
+    "E:\\CLIProxyAPI\\config.yaml",
+    "E:\\CLIProxyAPI\\auths",
+    "E:\\CLIProxyAPI\\cli-proxy-api.exe"
+  ]
 }
