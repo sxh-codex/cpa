@@ -1,0 +1,515 @@
+diff --git a/src/components/quota/QuotaSection.tsx b/src/components/quota/QuotaSection.tsx
+index a368e66..9a45ec2 100644
+--- a/src/components/quota/QuotaSection.tsx
++++ b/src/components/quota/QuotaSection.tsx
+@@ -31,8 +31,8 @@ type QuotaSetter<T> = (updater: QuotaUpdater<T>) => void;
+ 
+ type ViewMode = 'paged' | 'all';
+ 
+-const MAX_ITEMS_PER_PAGE = 25;
+-const MAX_SHOW_ALL_THRESHOLD = 30;
++const MAX_ITEMS_PER_PAGE = 100;
++const MAX_SHOW_ALL_THRESHOLD = 100;
+ 
+ interface QuotaPaginationState<T> {
+   pageSize: number;
+@@ -46,7 +46,7 @@ interface QuotaPaginationState<T> {
+   setLoading: (loading: boolean) => void;
+ }
+ 
+-const useQuotaPagination = <T,>(items: T[], defaultPageSize = 6): QuotaPaginationState<T> => {
++const useQuotaPagination = <T,>(items: T[], defaultPageSize = 100): QuotaPaginationState<T> => {
+   const [page, setPage] = useState(1);
+   const [pageSize, setPageSizeState] = useState(defaultPageSize);
+   const [loading, setLoading] = useState(false);
+@@ -156,8 +156,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
+     if (effectiveViewMode === 'all') {
+       setPageSize(Math.max(1, filteredFiles.length));
+     } else {
+-      // Paged mode: 3 rows * columns, capped to avoid oversized pages.
+-      setPageSize(Math.min(columns * 3, MAX_ITEMS_PER_PAGE));
++      setPageSize(MAX_ITEMS_PER_PAGE);
+     }
+   }, [effectiveViewMode, columns, filteredFiles.length, setPageSize]);
+ 
+diff --git a/src/features/authFiles/components/AuthFileCard.tsx b/src/features/authFiles/components/AuthFileCard.tsx
+index 6c290aa..1e5e5a0 100644
+--- a/src/features/authFiles/components/AuthFileCard.tsx
++++ b/src/features/authFiles/components/AuthFileCard.tsx
+@@ -38,6 +38,19 @@ import { AuthFileQuotaSection } from '@/features/authFiles/components/AuthFileQu
+ import styles from '@/pages/AuthFilesPage.module.scss';
+ 
+ const HEALTHY_STATUS_MESSAGES = new Set(['ok', 'healthy', 'ready', 'success', 'available']);
++const SPECIAL_AUTH_STATUSES = new Set(['无效认证', '401认证失效']);
++
++type OpenAIUsageStats = {
++  estimatedCostUsd: string;
++  fullQuotaEstimatedUsd: string | null;
++  inputTokens: number;
++  cachedInputTokens: number;
++  outputTokens: number;
++  reasoningTokens: number;
++  requestCount: number;
++  usageMissingCount: number;
++  pricingMissingCount: number;
++};
+ 
+ export type AuthFileCardProps = {
+   file: AuthFileItem;
+@@ -63,6 +76,90 @@ const resolveQuotaType = (file: AuthFileItem): QuotaProviderType | null => {
+   return provider as QuotaProviderType;
+ };
+ 
++const readNumberField = (value: unknown): number => {
++  if (typeof value === 'number' && Number.isFinite(value)) return value;
++  if (typeof value === 'string') {
++    const parsed = Number(value.trim());
++    if (Number.isFinite(parsed)) return parsed;
++  }
++  return 0;
++};
++
++const readStringField = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
++
++const formatEstimatedCost = (value: unknown): string => {
++  const rawValue =
++    typeof value === 'number' && Number.isFinite(value)
++      ? value
++      : Number(readStringField(value).replace(/^\$/, ''));
++  return `$${(Number.isFinite(rawValue) ? rawValue : 0).toFixed(2)}`;
++};
++
++const formatOptionalEstimatedCost = (value: unknown): string | null => {
++  if (value === null || value === undefined) return null;
++  if (typeof value === 'number') {
++    return Number.isFinite(value) ? `$${value.toFixed(2)}` : null;
++  }
++  const text = readStringField(value);
++  if (!text) return null;
++  const parsed = Number(text.replace(/^\$/, ''));
++  return Number.isFinite(parsed) ? `$${parsed.toFixed(2)}` : null;
++};
++
++const resolveOpenAIUsage = (
++  file: AuthFileItem,
++  providerKey: string,
++  authIndex: string | null
++): OpenAIUsageStats | null => {
++  const raw = file['openai_usage'] ?? file.openaiUsage;
++  const source =
++    raw && typeof raw === 'object'
++      ? (raw as Record<string, unknown>)
++      : (providerKey === 'codex' || providerKey === 'openai') &&
++          String(file.name ?? '')
++            .trim()
++            .toLowerCase()
++            .endsWith('.json')
++        ? {
++            auth_index: authIndex ?? '',
++            auth_file_name: file.name ?? '',
++            account_email: file.email ?? '',
++            request_count: 0,
++            input_tokens: 0,
++            cached_input_tokens: 0,
++            cached_tokens: 0,
++            output_tokens: 0,
++            reasoning_tokens: 0,
++            usage_missing_count: 0,
++            pricing_missing_count: 0,
++            estimated_cost_usd: '$0.000000',
++          }
++        : null;
++
++  if (!source) return null;
++
++  return {
++    estimatedCostUsd: formatEstimatedCost(source.estimated_cost_usd ?? source.estimatedCostUsd),
++    fullQuotaEstimatedUsd: formatOptionalEstimatedCost(
++      source.full_quota_estimated_usd ?? source.fullQuotaEstimatedUsd
++    ),
++    inputTokens: readNumberField(source.input_tokens ?? source.inputTokens),
++    cachedInputTokens: readNumberField(
++      source.cached_input_tokens ??
++        source.cachedInputTokens ??
++        source.cached_tokens ??
++        source.cachedTokens
++    ),
++    outputTokens: readNumberField(source.output_tokens ?? source.outputTokens),
++    reasoningTokens: readNumberField(source.reasoning_tokens ?? source.reasoningTokens),
++    requestCount: readNumberField(source.request_count ?? source.requestCount),
++    usageMissingCount: readNumberField(source.usage_missing_count ?? source.usageMissingCount),
++    pricingMissingCount: readNumberField(
++      source.pricing_missing_count ?? source.pricingMissingCount
++    ),
++  };
++};
++
+ export function AuthFileCard(props: AuthFileCardProps) {
+   const { t } = useTranslation();
+   const {
+@@ -120,6 +217,8 @@ export function AuthFileCard(props: AuthFileCardProps) {
+     (authIndexKey && statusBarCache.get(authIndexKey)) ||
+     statusBarDataFromRecentRequests(recentBuckets);
+   const rawStatusMessage = getAuthFileStatusMessage(file);
++  const statusName = String(file.status ?? '').trim();
++  const specialStatus = SPECIAL_AUTH_STATUSES.has(statusName) ? statusName : null;
+   const hasStatusWarning =
+     Boolean(rawStatusMessage) && !HEALTHY_STATUS_MESSAGES.has(rawStatusMessage.toLowerCase());
+ 
+@@ -127,20 +226,37 @@ export function AuthFileCard(props: AuthFileCardProps) {
+   const noteValue = typeof file.note === 'string' ? file.note.trim() : '';
+   const stateLabel = isRuntimeOnly
+     ? t('auth_files.type_virtual') || '虚拟认证文件'
+-    : file.disabled
+-      ? t('auth_files.health_status_disabled')
+-      : hasStatusWarning
+-        ? t('auth_files.health_status_warning')
+-        : rawStatusMessage
+-          ? t('auth_files.health_status_healthy')
+-          : t('auth_files.status_toggle_label');
++    : (specialStatus ??
++      (file.disabled
++        ? t('auth_files.health_status_disabled')
++        : hasStatusWarning
++          ? t('auth_files.health_status_warning')
++          : rawStatusMessage
++            ? t('auth_files.health_status_healthy')
++            : t('auth_files.status_toggle_label')));
+   const stateBadgeClass = isRuntimeOnly
+     ? styles.stateBadgeVirtual
++    : specialStatus
++      ? styles.stateBadgeWarning
+     : file.disabled
+       ? styles.stateBadgeDisabled
+       : hasStatusWarning
+         ? styles.stateBadgeWarning
+         : styles.stateBadgeActive;
++  const openAIUsage = resolveOpenAIUsage(file, providerKey, authIndexKey);
++  const openAIUsageItems: Array<[string, string | number]> = openAIUsage
++    ? [
++        ['估算费用', openAIUsage.estimatedCostUsd],
++        ['输入 Token', openAIUsage.inputTokens],
++        ['缓存输入 Token', openAIUsage.cachedInputTokens],
++        ['输出 Token', openAIUsage.outputTokens],
++        ['推理 Token', openAIUsage.reasoningTokens],
++        ['请求次数', openAIUsage.requestCount],
++        ['Usage 缺失', openAIUsage.usageMissingCount],
++        ['计价缺失', openAIUsage.pricingMissingCount],
++        ['全额度', openAIUsage.fullQuotaEstimatedUsd ?? '采样中'],
++      ]
++    : [];
+ 
+   return (
+     <div
+@@ -223,6 +339,17 @@ export function AuthFileCard(props: AuthFileCardProps) {
+             )}
+           </div>
+ 
++          {openAIUsage && (
++            <div className={styles.openAIUsage} aria-label="OpenAI usage">
++              {openAIUsageItems.map(([label, value]) => (
++                <span className={styles.openAIUsageItem} key={label}>
++                  <span className={styles.openAIUsageLabel}>{label}</span>
++                  <span className={styles.openAIUsageValue}>{value}</span>
++                </span>
++              ))}
++            </div>
++          )}
++
+           {rawStatusMessage && hasStatusWarning && (
+             <div className={styles.healthStatusMessage} title={rawStatusMessage}>
+               <IconInfo className={styles.messageIcon} size={14} />
+diff --git a/src/features/authFiles/constants.ts b/src/features/authFiles/constants.ts
+index 24753a8..6d8b142 100644
+--- a/src/features/authFiles/constants.ts
++++ b/src/features/authFiles/constants.ts
+@@ -49,7 +49,7 @@ export const OAUTH_PROVIDER_PRESETS = [
+ const OAUTH_PROVIDER_EXCLUDES = new Set(['all', 'unknown', 'empty']);
+ 
+ export const MIN_CARD_PAGE_SIZE = 3;
+-export const MAX_CARD_PAGE_SIZE = 30;
++export const MAX_CARD_PAGE_SIZE = 100;
+ 
+ export const INTEGER_STRING_PATTERN = /^[+-]?\d+$/;
+ export const TRUTHY_TEXT_VALUES = new Set(['true', '1', 'yes', 'y', 'on']);
+diff --git a/src/features/authFiles/hooks/useAuthFilesData.ts b/src/features/authFiles/hooks/useAuthFilesData.ts
+index 19ef490..2396666 100644
+--- a/src/features/authFiles/hooks/useAuthFilesData.ts
++++ b/src/features/authFiles/hooks/useAuthFilesData.ts
+@@ -42,6 +42,8 @@ export type UseAuthFilesDataResult = {
+   handleFileChange: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
+   handleDelete: (name: string) => void;
+   handleDeleteAll: (options: DeleteAllOptions) => void;
++  handleRemoveInvalid: (count: number, afterRemove?: () => Promise<void>) => void;
++  handleRemove401Invalid: (count: number, afterRemove?: () => Promise<void>) => void;
+   handleDownload: (name: string) => Promise<void>;
+   handleStatusToggle: (item: AuthFileItem, enabled: boolean) => Promise<void>;
+   toggleSelect: (name: string) => void;
+@@ -408,6 +410,56 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
+     [applyDeletedFiles, deselectAll, files, showConfirmation, showNotification, t]
+   );
+ 
++  const handleRemoveInvalid = useCallback(
++    (count: number, afterRemove?: () => Promise<void>) => {
++      if (count <= 0) return;
++      showConfirmation({
++        title: '403移除',
++        message: `将移除 ${count} 个无效认证文件。移除后它们不会参与模型调用。`,
++        variant: 'danger',
++        confirmText: t('common.confirm'),
++        onConfirm: async () => {
++          setDeletingAll(true);
++          try {
++            await authFilesApi.removeInvalid();
++            await (afterRemove?.() ?? loadFiles());
++          } catch (err: unknown) {
++            const errorMessage = err instanceof Error ? err.message : '';
++            showNotification(`${t('notification.delete_failed')}: ${errorMessage}`, 'error');
++          } finally {
++            setDeletingAll(false);
++          }
++        },
++      });
++    },
++    [loadFiles, showConfirmation, showNotification, t]
++  );
++
++  const handleRemove401Invalid = useCallback(
++    (count: number, afterRemove?: () => Promise<void>) => {
++      if (count <= 0) return;
++      showConfirmation({
++        title: '401认证失效',
++        message: `将移除 ${count} 个 401 认证失效文件到 C:\\Users\\admin\\.cli-proxy-api\\removed\\401-invalid\\。移除后它们不会参与模型调用。`,
++        variant: 'danger',
++        confirmText: t('common.confirm'),
++        onConfirm: async () => {
++          setDeletingAll(true);
++          try {
++            await authFilesApi.remove401Invalid();
++            await (afterRemove?.() ?? loadFiles());
++          } catch (err: unknown) {
++            const errorMessage = err instanceof Error ? err.message : '';
++            showNotification(`${t('notification.delete_failed')}: ${errorMessage}`, 'error');
++          } finally {
++            setDeletingAll(false);
++          }
++        },
++      });
++    },
++    [loadFiles, showConfirmation, showNotification, t]
++  );
++
+   const handleDownload = useCallback(
+     async (name: string) => {
+       try {
+@@ -653,6 +705,8 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
+     handleFileChange,
+     handleDelete,
+     handleDeleteAll,
++    handleRemoveInvalid,
++    handleRemove401Invalid,
+     handleDownload,
+     handleStatusToggle,
+     toggleSelect,
+diff --git a/src/features/authFiles/uiState.ts b/src/features/authFiles/uiState.ts
+index 034b809..81b77d4 100644
+--- a/src/features/authFiles/uiState.ts
++++ b/src/features/authFiles/uiState.ts
+@@ -50,10 +50,18 @@ const readAuthFilesUiStateFromStorage = (
+ export const readAuthFilesUiState = (): AuthFilesUiState | null => {
+   if (typeof window === 'undefined') return null;
+   try {
+-    return (
++    const state =
+       readAuthFilesUiStateFromStorage(window.localStorage) ??
+-      readAuthFilesUiStateFromStorage(window.sessionStorage)
+-    );
++      readAuthFilesUiStateFromStorage(window.sessionStorage);
++    if (!state) return null;
++    const normalized = {
++      ...state,
++      pageSize: 100,
++      regularPageSize: 100,
++      compactPageSize: 100,
++    };
++    writeAuthFilesUiState(normalized);
++    return normalized;
+   } catch {
+     return null;
+   }
+diff --git a/src/pages/AuthFilesPage.module.scss b/src/pages/AuthFilesPage.module.scss
+index b6281c0..1c20dfc 100644
+--- a/src/pages/AuthFilesPage.module.scss
++++ b/src/pages/AuthFilesPage.module.scss
+@@ -945,6 +945,7 @@
+   display: flex;
+   flex-direction: column;
+   min-height: 100%;
++  min-width: 0;
+   transition:
+     transform $transition-fast,
+     box-shadow $transition-fast,
+@@ -1097,6 +1098,7 @@
+   align-items: stretch;
+   gap: $spacing-md;
+   min-height: 100%;
++  min-width: 0;
+ }
+ 
+ .fileCardMain {
+@@ -1327,6 +1329,58 @@
+   word-break: break-word;
+ }
+ 
++.openAIUsage {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 4px 12px;
++  width: 100%;
++  max-width: 100%;
++  min-width: 0;
++  overflow: hidden;
++  padding: 4px 0 2px;
++}
++
++.openAIUsageItem {
++  display: inline-flex;
++  align-items: baseline;
++  gap: 3px;
++  max-width: 100%;
++  min-width: 0;
++  overflow: hidden;
++  white-space: nowrap;
++}
++
++.openAIUsageLabel {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--text-tertiary);
++  font-size: 11px;
++  font-weight: 600;
++  line-height: 1.25;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++
++  &::after {
++    content: ':';
++  }
++}
++
++.openAIUsageValue {
++  min-width: 0;
++  max-width: 120px;
++  overflow: hidden;
++  color: var(--text-primary);
++  font-size: 12px;
++  font-variant-numeric: tabular-nums;
++  font-weight: 700;
++  line-height: 1.35;
++  text-overflow: ellipsis;
++  overflow-wrap: normal;
++  word-break: normal;
++  white-space: nowrap;
++}
++
+ .priorityBadge {
+   min-width: 0;
+ }
+diff --git a/src/pages/AuthFilesPage.tsx b/src/pages/AuthFilesPage.tsx
+index a9016c3..692a60d 100644
+--- a/src/pages/AuthFilesPage.tsx
++++ b/src/pages/AuthFilesPage.tsx
+@@ -68,8 +68,8 @@ const easePower3Out = (progress: number) => 1 - (1 - progress) ** 4;
+ const easePower2In = (progress: number) => progress ** 3;
+ const BATCH_BAR_BASE_TRANSFORM = 'translateX(-50%)';
+ const BATCH_BAR_HIDDEN_TRANSFORM = 'translateX(-50%) translateY(56px)';
+-const DEFAULT_REGULAR_PAGE_SIZE = 9;
+-const DEFAULT_COMPACT_PAGE_SIZE = 12;
++const DEFAULT_REGULAR_PAGE_SIZE = 100;
++const DEFAULT_COMPACT_PAGE_SIZE = 100;
+ 
+ const escapeWildcardSearchSegment = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ 
+@@ -138,6 +138,8 @@ export function AuthFilesPage() {
+     handleFileChange,
+     handleDelete,
+     handleDeleteAll,
++    handleRemoveInvalid,
++    handleRemove401Invalid,
+     handleDownload,
+     handleStatusToggle,
+     toggleSelect,
+@@ -239,15 +241,15 @@ export function AuthFilesPage() {
+       }
+       const legacyPageSize =
+         typeof persisted.pageSize === 'number' && Number.isFinite(persisted.pageSize)
+-          ? clampCardPageSize(persisted.pageSize)
++          ? DEFAULT_REGULAR_PAGE_SIZE
+           : null;
+       const regularPageSize =
+         typeof persisted.regularPageSize === 'number' && Number.isFinite(persisted.regularPageSize)
+-          ? clampCardPageSize(persisted.regularPageSize)
++          ? DEFAULT_REGULAR_PAGE_SIZE
+           : (legacyPageSize ?? DEFAULT_REGULAR_PAGE_SIZE);
+       const compactPageSize =
+         typeof persisted.compactPageSize === 'number' && Number.isFinite(persisted.compactPageSize)
+-          ? clampCardPageSize(persisted.compactPageSize)
++          ? DEFAULT_COMPACT_PAGE_SIZE
+           : (legacyPageSize ?? DEFAULT_COMPACT_PAGE_SIZE);
+       setPageSizeByMode({
+         regular: regularPageSize,
+@@ -359,6 +361,15 @@ export function AuthFilesPage() {
+     await Promise.all([loadFiles(), loadExcluded(), loadModelAlias()]);
+   }, [loadFiles, loadExcluded, loadModelAlias]);
+ 
++  const invalidAuthCount = useMemo(
++    () => files.filter((file) => String(file.status ?? '').trim() === '无效认证').length,
++    [files]
++  );
++  const tokenInvalidCount = useMemo(
++    () => files.filter((file) => String(file.status ?? '').trim() === '401认证失效').length,
++    [files]
++  );
++
+   useHeaderRefresh(handleHeaderRefresh);
+ 
+   useEffect(() => {
+@@ -700,6 +711,22 @@ export function AuthFilesPage() {
+             >
+               {t('auth_files.upload_button')}
+             </Button>
++            <Button
++              variant="danger"
++              size="sm"
++              onClick={() => handleRemoveInvalid(invalidAuthCount, handleHeaderRefresh)}
++              disabled={disableControls || invalidAuthCount === 0}
++            >
++              {`403移除（${invalidAuthCount}）`}
++            </Button>
++            <Button
++              variant="danger"
++              size="sm"
++              onClick={() => handleRemove401Invalid(tokenInvalidCount, handleHeaderRefresh)}
++              disabled={disableControls || tokenInvalidCount === 0}
++            >
++              {`401移除（${tokenInvalidCount}）`}
++            </Button>
+             <Button
+               variant="danger"
+               size="sm"
+diff --git a/src/services/api/authFiles.ts b/src/services/api/authFiles.ts
+index 5ddac9c..6d3feef 100644
+--- a/src/services/api/authFiles.ts
++++ b/src/services/api/authFiles.ts
+@@ -378,6 +378,10 @@ export const authFilesApi = {
+ 
+   deleteAll: () => apiClient.delete('/auth-files', { params: { all: true } }),
+ 
++  removeInvalid: () => apiClient.post('/auth-files/remove-invalid'),
++
++  remove401Invalid: () => apiClient.post('/auth-files/remove-401-invalid'),
++
+   downloadText: async (name: string): Promise<string> => {
+     const response = await apiClient.getRaw(
+       `/auth-files/download?name=${encodeURIComponent(name)}`,

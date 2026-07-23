@@ -1,4 +1,4 @@
-diff --git a/internal/api/handlers/management/api_tools.go b/internal/api/handlers/management/api_tools.go
+﻿diff --git a/internal/api/handlers/management/api_tools.go b/internal/api/handlers/management/api_tools.go
 index e125192..995f74e 100644
 --- a/internal/api/handlers/management/api_tools.go
 +++ b/internal/api/handlers/management/api_tools.go
@@ -663,18 +663,21 @@ index ca1f313..da6e4c8 100644
  			name: "openai-compatibility",
  			auth: &coreauth.Auth{
 diff --git a/internal/api/handlers/management/auth_files.go b/internal/api/handlers/management/auth_files.go
-index 17f2028..d776a0f 100644
+index 6e4c3bd..0469f36 100644
 --- a/internal/api/handlers/management/auth_files.go
 +++ b/internal/api/handlers/management/auth_files.go
-@@ -29,6 +29,7 @@ import (
+@@ -29,8 +29,10 @@ import (
  	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 +	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-@@ -68,6 +69,18 @@ var (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+ 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+@@ -69,6 +71,18 @@ var (
  	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
  )
  
@@ -693,7 +696,7 @@ index 17f2028..d776a0f 100644
  func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
  	if len(meta) == 0 {
  		return time.Time{}, false
-@@ -462,7 +475,8 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+@@ -532,7 +546,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
  		return nil
  	}
  	path := strings.TrimSpace(authAttribute(auth, "path"))
@@ -703,7 +706,7 @@ index 17f2028..d776a0f 100644
  		return nil
  	}
  	name := strings.TrimSpace(auth.FileName)
-@@ -487,6 +501,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+@@ -557,18 +572,37 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
  	entry["success"] = auth.Success
  	entry["failed"] = auth.Failed
  	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
@@ -713,7 +716,23 @@ index 17f2028..d776a0f 100644
  	if email := authEmail(auth); email != "" {
  		entry["email"] = email
  	}
-@@ -498,7 +515,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+ 	if projectID := authProjectID(auth); projectID != "" {
+ 		entry["project_id"] = projectID
+ 	}
++	if helps.IsAgentIdentityAuth(auth) {
++		entry["auth_mode"] = helps.OpenAIAuthModeAgentIdentity
++		if workspaceID := authMetadataString(auth, "workspace_id"); workspaceID != "" {
++			entry["workspace_id"] = workspaceID
++		}
++		if planType := authMetadataString(auth, "plan_type"); planType != "" {
++			entry["plan_type"] = planType
++		}
++		if runtimeID := redactedAgentRuntimeID(authMetadataString(auth, "agent_runtime_id")); runtimeID != "" {
++			entry["agent_runtime_id"] = runtimeID
++		}
++	}
+ 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+ 		if accountType != "" {
  			entry["account_type"] = accountType
  		}
  		if account != "" {
@@ -726,10 +745,31 @@ index 17f2028..d776a0f 100644
  		}
  	}
  	if !auth.CreatedAt.IsZero() {
-@@ -570,6 +591,103 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+@@ -640,6 +674,124 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
  	return entry
  }
  
++func authMetadataString(auth *coreauth.Auth, key string) string {
++	if auth == nil || auth.Metadata == nil {
++		return ""
++	}
++	if value, ok := auth.Metadata[key].(string); ok {
++		return strings.TrimSpace(value)
++	}
++	return ""
++}
++
++func redactedAgentRuntimeID(value string) string {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return ""
++	}
++	if len(value) <= 10 {
++		return value
++	}
++	return value[:6] + "..." + value[len(value)-4:]
++}
++
 +func (h *Handler) openAIUsageForAuth(auth *coreauth.Auth) (openaiusage.AccountStats, bool) {
 +	if auth == nil {
 +		return openaiusage.AccountStats{}, false
@@ -830,7 +870,64 @@ index 17f2028..d776a0f 100644
  func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {
  	if auth == nil {
  		return false, false
-@@ -894,6 +1012,103 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
+@@ -816,7 +968,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
+ 		return
+ 	}
+ 	if len(fileHeaders) == 1 {
+-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
++		result, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0])
++		if errUpload != nil {
+ 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
+ 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+ 				return
+@@ -824,6 +977,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
+ 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
+ 			return
+ 		}
++		if result.IsWrapper {
++			c.JSON(http.StatusOK, result.responseBody())
++			return
++		}
+ 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+ 		return
+ 	}
+@@ -831,7 +988,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
+ 		uploaded := make([]string, 0, len(fileHeaders))
+ 		failed := make([]gin.H, 0)
+ 		for _, file := range fileHeaders {
+-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
++			result, errUpload := h.storeUploadedAuthFile(ctx, file)
+ 			if errUpload != nil {
+ 				failureName := ""
+ 				if file != nil {
+@@ -844,7 +1001,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
+ 				failed = append(failed, gin.H{"name": failureName, "error": msg})
+ 				continue
+ 			}
+-			uploaded = append(uploaded, name)
++			uploaded = append(uploaded, result.Files...)
++			failed = append(failed, result.Failed...)
+ 		}
+ 		if len(failed) > 0 {
+ 			c.JSON(http.StatusMultiStatus, gin.H{
+@@ -876,10 +1034,15 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
+ 		c.JSON(400, gin.H{"error": "failed to read body"})
+ 		return
+ 	}
+-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
++	result, err := h.writeUploadedAuthData(ctx, filepath.Base(name), data)
++	if err != nil {
+ 		c.JSON(500, gin.H{"error": err.Error()})
+ 		return
+ 	}
++	if result.IsWrapper {
++		c.JSON(http.StatusOK, result.responseBody())
++		return
++	}
+ 	c.JSON(200, gin.H{"status": "ok"})
+ }
+ 
+@@ -964,6 +1127,103 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
  	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
  }
  
@@ -934,7 +1031,245 @@ index 17f2028..d776a0f 100644
  func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
  	if h == nil || c == nil || c.ContentType() != "multipart/form-data" {
  		return nil, nil
-@@ -1856,6 +2071,50 @@ func cleanAuthFilePath(path string) string {
+@@ -989,28 +1249,230 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
+ 	return headers, nil
+ }
+ 
+-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
++type uploadedAuthResult struct {
++	IsWrapper bool
++	Uploaded  int
++	Skipped   int
++	Files     []string
++	Failed    []gin.H
++}
++
++func (r uploadedAuthResult) responseBody() gin.H {
++	status := "ok"
++	if len(r.Failed) > 0 || r.Skipped > 0 {
++		status = "partial"
++	}
++	return gin.H{
++		"status":   status,
++		"uploaded": r.Uploaded,
++		"skipped":  r.Skipped,
++		"files":    r.Files,
++		"failed":   r.Failed,
++	}
++}
++
++func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (uploadedAuthResult, error) {
+ 	if file == nil {
+-		return "", fmt.Errorf("no file uploaded")
++		return uploadedAuthResult{}, fmt.Errorf("no file uploaded")
+ 	}
+ 	name := filepath.Base(strings.TrimSpace(file.Filename))
+ 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+-		return "", errAuthFileMustBeJSON
++		return uploadedAuthResult{}, errAuthFileMustBeJSON
+ 	}
+ 	src, err := file.Open()
+ 	if err != nil {
+-		return "", fmt.Errorf("failed to open uploaded file: %w", err)
++		return uploadedAuthResult{}, fmt.Errorf("failed to open uploaded file: %w", err)
+ 	}
+ 	defer src.Close()
+ 
+ 	data, err := io.ReadAll(src)
+ 	if err != nil {
+-		return "", fmt.Errorf("failed to read uploaded file: %w", err)
++		return uploadedAuthResult{}, fmt.Errorf("failed to read uploaded file: %w", err)
++	}
++	return h.writeUploadedAuthData(ctx, name, data)
++}
++
++func (h *Handler) writeUploadedAuthData(ctx context.Context, name string, data []byte) (uploadedAuthResult, error) {
++	if wrapper, ok := parseSub2APIAgentIdentityExport(data); ok {
++		return h.writeSub2APIAgentIdentityExport(ctx, name, wrapper)
+ 	}
+ 	if err := h.writeAuthFile(ctx, name, data); err != nil {
+-		return "", err
++		return uploadedAuthResult{}, err
++	}
++	return uploadedAuthResult{Uploaded: 1, Files: []string{filepath.Base(name)}}, nil
++}
++
++type sub2APIAgentIdentityExport struct {
++	Accounts []sub2APIExportAccount `json:"accounts"`
++}
++
++type sub2APIExportAccount struct {
++	Name        string                  `json:"name"`
++	Platform    string                  `json:"platform"`
++	Type        string                  `json:"type"`
++	Credentials sub2APIAgentCredentials `json:"credentials"`
++}
++
++type sub2APIAgentCredentials struct {
++	AuthMode                     string `json:"auth_mode"`
++	AuthModeCamel                string `json:"authMode"`
++	AgentPrivateKey              string `json:"agent_private_key"`
++	AgentPrivateKeyCamel         string `json:"agentPrivateKey"`
++	AgentRuntimeID               string `json:"agent_runtime_id"`
++	AgentRuntimeIDCamel          string `json:"agentRuntimeId"`
++	TaskID                       string `json:"task_id"`
++	TaskIDCamel                  string `json:"taskId"`
++	WorkspaceID                  string `json:"workspace_id"`
++	WorkspaceIDCamel             string `json:"workspaceId"`
++	Email                        string `json:"email"`
++	AccountID                    string `json:"account_id"`
++	AccountIDCamel               string `json:"accountId"`
++	ChatGPTUserID                string `json:"chatgpt_user_id"`
++	ChatGPTUserIDCamel           string `json:"chatgptUserId"`
++	PlanType                     string `json:"plan_type"`
++	PlanTypeCamel                string `json:"planType"`
++	ChatGPTAccountIsFedRAMP      *bool  `json:"chatgpt_account_is_fedramp"`
++	ChatGPTAccountIsFedRAMPCamel *bool  `json:"chatgptAccountIsFedramp"`
++}
++
++func parseSub2APIAgentIdentityExport(data []byte) (sub2APIAgentIdentityExport, bool) {
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(data, &raw); err != nil {
++		return sub2APIAgentIdentityExport{}, false
++	}
++	accountsRaw, ok := raw["accounts"]
++	if !ok {
++		return sub2APIAgentIdentityExport{}, false
++	}
++	var wrapper sub2APIAgentIdentityExport
++	if err := json.Unmarshal(accountsRaw, &wrapper.Accounts); err != nil {
++		return sub2APIAgentIdentityExport{}, false
++	}
++	return wrapper, true
++}
++
++func (h *Handler) writeSub2APIAgentIdentityExport(ctx context.Context, originalName string, wrapper sub2APIAgentIdentityExport) (uploadedAuthResult, error) {
++	result := uploadedAuthResult{IsWrapper: true, Files: make([]string, 0, len(wrapper.Accounts)), Failed: make([]gin.H, 0)}
++	for i, account := range wrapper.Accounts {
++		fileName, payload, err := buildSub2APIAgentIdentityAuthFile(originalName, i, account)
++		if err != nil {
++			result.Skipped++
++			result.Failed = append(result.Failed, gin.H{"index": i, "name": account.Name, "error": err.Error()})
++			continue
++		}
++		uniqueName := h.uniqueAuthFileName(fileName)
++		if err := h.writeAuthFile(ctx, uniqueName, payload); err != nil {
++			result.Skipped++
++			result.Failed = append(result.Failed, gin.H{"index": i, "name": account.Name, "error": err.Error()})
++			continue
++		}
++		result.Uploaded++
++		result.Files = append(result.Files, uniqueName)
++	}
++	return result, nil
++}
++
++func buildSub2APIAgentIdentityAuthFile(originalName string, index int, account sub2APIExportAccount) (string, []byte, error) {
++	if !strings.EqualFold(strings.TrimSpace(account.Type), "oauth") {
++		return "", nil, fmt.Errorf("account type is not oauth")
++	}
++	creds := account.Credentials
++	if !strings.EqualFold(sub2APIFirstNonEmpty(creds.AuthMode, creds.AuthModeCamel), helps.OpenAIAuthModeAgentIdentity) {
++		return "", nil, fmt.Errorf("auth_mode is not agentIdentity")
++	}
++	privateKey := sub2APIFirstNonEmpty(creds.AgentPrivateKey, creds.AgentPrivateKeyCamel)
++	if privateKey == "" {
++		return "", nil, fmt.Errorf("agent_private_key is required")
++	}
++	runtimeID := sub2APIFirstNonEmpty(creds.AgentRuntimeID, creds.AgentRuntimeIDCamel)
++	if runtimeID == "" {
++		return "", nil, fmt.Errorf("agent_runtime_id is required")
++	}
++	fedramp := false
++	if creds.ChatGPTAccountIsFedRAMP != nil {
++		fedramp = *creds.ChatGPTAccountIsFedRAMP
++	} else if creds.ChatGPTAccountIsFedRAMPCamel != nil {
++		fedramp = *creds.ChatGPTAccountIsFedRAMPCamel
++	}
++	metadata := map[string]any{
++		"type":                       "codex",
++		"auth_kind":                  "oauth",
++		"auth_mode":                  helps.OpenAIAuthModeAgentIdentity,
++		"email":                      strings.TrimSpace(creds.Email),
++		"agent_runtime_id":           runtimeID,
++		"agent_private_key":          privateKey,
++		"task_id":                    sub2APIFirstNonEmpty(creds.TaskID, creds.TaskIDCamel),
++		"workspace_id":               sub2APIFirstNonEmpty(creds.WorkspaceID, creds.WorkspaceIDCamel),
++		"account_id":                 sub2APIFirstNonEmpty(creds.AccountID, creds.AccountIDCamel),
++		"chatgpt_user_id":            sub2APIFirstNonEmpty(creds.ChatGPTUserID, creds.ChatGPTUserIDCamel),
++		"plan_type":                  sub2APIFirstNonEmpty(creds.PlanType, creds.PlanTypeCamel),
++		"chatgpt_account_is_fedramp": fedramp,
++	}
++	payload, err := json.MarshalIndent(metadata, "", "  ")
++	if err != nil {
++		return "", nil, fmt.Errorf("failed to serialize agent identity auth file")
++	}
++	return sub2APIAgentIdentityFileName(originalName, index, metadata), payload, nil
++}
++
++func sub2APIAgentIdentityFileName(originalName string, index int, metadata map[string]any) string {
++	seedParts := []string{
++		fmt.Sprintf("%d", index),
++		strings.TrimSpace(fmt.Sprint(metadata["email"])),
++		strings.TrimSpace(fmt.Sprint(metadata["workspace_id"])),
++		strings.TrimSpace(fmt.Sprint(metadata["agent_runtime_id"])),
++	}
++	sum := sha256.Sum256([]byte(strings.Join(seedParts, "|")))
++	prefix := sanitizeAuthFileNamePart(strings.TrimSuffix(filepath.Base(originalName), filepath.Ext(originalName)))
++	if prefix == "" {
++		prefix = "sub2api-agent"
++	}
++	return fmt.Sprintf("%s-agentIdentity-%s.json", prefix, hex.EncodeToString(sum[:])[:12])
++}
++
++func sanitizeAuthFileNamePart(value string) string {
++	value = strings.ToLower(strings.TrimSpace(value))
++	var b strings.Builder
++	for _, r := range value {
++		switch {
++		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
++			b.WriteRune(r)
++		case r == '-' || r == '_':
++			b.WriteRune(r)
++		case r == '.' || r == ' ':
++			b.WriteByte('-')
++		}
++	}
++	return strings.Trim(b.String(), "-_")
++}
++
++func sub2APIFirstNonEmpty(values ...string) string {
++	for _, value := range values {
++		if trimmed := strings.TrimSpace(value); trimmed != "" {
++			return trimmed
++		}
++	}
++	return ""
++}
++
++func (h *Handler) uniqueAuthFileName(name string) string {
++	base := filepath.Base(strings.TrimSpace(name))
++	if base == "" {
++		base = "sub2api-agentIdentity.json"
++	}
++	ext := filepath.Ext(base)
++	stem := strings.TrimSuffix(base, ext)
++	if ext == "" {
++		ext = ".json"
++	}
++	candidate := base
++	for i := 1; ; i++ {
++		path := filepath.Join(h.cfg.AuthDir, candidate)
++		if _, err := os.Stat(path); os.IsNotExist(err) {
++			return candidate
++		}
++		candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+ 	}
+-	return name, nil
+ }
+ 
+ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+@@ -1915,6 +2377,50 @@ func cleanAuthFilePath(path string) string {
  	return filepath.Clean(path)
  }
  
@@ -985,6 +1320,162 @@ index 17f2028..d776a0f 100644
  func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
  	if strings.TrimSpace(path) == "" {
  		return fmt.Errorf("auth path is empty")
+diff --git a/internal/api/handlers/management/auth_files_agent_identity_test.go b/internal/api/handlers/management/auth_files_agent_identity_test.go
+new file mode 100644
+index 0000000..465d37d
+--- /dev/null
++++ b/internal/api/handlers/management/auth_files_agent_identity_test.go
+@@ -0,0 +1,150 @@
++package management
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++)
++
++func testAgentIdentityPrivateKey(t *testing.T) string {
++	t.Helper()
++	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatalf("GenerateKey: %v", err)
++	}
++	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
++	if err != nil {
++		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
++	}
++	return base64.StdEncoding.EncodeToString(der)
++}
++
++func TestSub2APIAgentIdentityWrapperImportCreatesDistinctAuthFiles(t *testing.T) {
++	authDir := t.TempDir()
++	manager := coreauth.NewManager(nil, nil, nil)
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	privateKey := testAgentIdentityPrivateKey(t)
++	payload := []byte(`{
++  "type":"sub2api-export",
++  "accounts":[
++    {"name":"same","platform":"openai","type":"oauth","credentials":{"auth_mode":"agentIdentity","agent_private_key":"` + privateKey + `","agent_runtime_id":"runtime-a","workspace_id":"workspace-a","email":"same@example.com","account_id":"acct-a","chatgpt_user_id":"user-a","plan_type":"plus","chatgpt_account_is_fedramp":false}},
++    {"name":"same","platform":"openai","type":"oauth","credentials":{"auth_mode":"agentIdentity","agent_private_key":"` + privateKey + `","agent_runtime_id":"runtime-b","workspace_id":"workspace-b","email":"same@example.com","account_id":"acct-b","chatgpt_user_id":"user-b","plan_type":"team"}}
++  ]
++}`)
++
++	result, err := h.writeUploadedAuthData(context.Background(), "sub2api.json", payload)
++	if err != nil {
++		t.Fatalf("writeUploadedAuthData: %v", err)
++	}
++	if !result.IsWrapper || result.Uploaded != 2 || result.Skipped != 0 || len(result.Files) != 2 {
++		t.Fatalf("result = %+v", result)
++	}
++	if result.Files[0] == result.Files[1] {
++		t.Fatalf("expected distinct files, got %q", result.Files[0])
++	}
++	for _, file := range result.Files {
++		data, errRead := os.ReadFile(filepath.Join(authDir, file))
++		if errRead != nil {
++			t.Fatalf("read generated file: %v", errRead)
++		}
++		var meta map[string]any
++		if err := json.Unmarshal(data, &meta); err != nil {
++			t.Fatalf("generated json: %v", err)
++		}
++		if meta["type"] != "codex" || meta["auth_mode"] != helps.OpenAIAuthModeAgentIdentity {
++			t.Fatalf("generated metadata = %#v", meta)
++		}
++		if meta["agent_private_key"] != privateKey {
++			t.Fatal("private key was not preserved in generated credential file")
++		}
++		if !managerHasFileName(manager, file) {
++			t.Fatalf("manager missing auth %q", file)
++		}
++	}
++}
++
++func managerHasFileName(manager *coreauth.Manager, fileName string) bool {
++	for _, auth := range manager.List() {
++		if auth.FileName == fileName {
++			return true
++		}
++	}
++	return false
++}
++
++func TestSub2APIAgentIdentityWrapperImportValidation(t *testing.T) {
++	privateKey := testAgentIdentityPrivateKey(t)
++	tests := []struct {
++		name    string
++		payload string
++		wantErr string
++	}{
++		{name: "missing private key", payload: `{"type":"oauth","credentials":{"auth_mode":"agentIdentity","agent_runtime_id":"runtime"}}`, wantErr: "agent_private_key is required"},
++		{name: "missing runtime", payload: `{"type":"oauth","credentials":{"auth_mode":"agentIdentity","agent_private_key":"` + privateKey + `"}}`, wantErr: "agent_runtime_id is required"},
++		{name: "wrong type", payload: `{"type":"api_key","credentials":{"auth_mode":"agentIdentity","agent_private_key":"` + privateKey + `","agent_runtime_id":"runtime"}}`, wantErr: "account type is not oauth"},
++		{name: "missing task allowed", payload: `{"type":"oauth","credentials":{"auth_mode":"agentIdentity","agent_private_key":"` + privateKey + `","agent_runtime_id":"runtime"}}`},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			var account sub2APIExportAccount
++			if err := json.Unmarshal([]byte(tt.payload), &account); err != nil {
++				t.Fatalf("unmarshal account: %v", err)
++			}
++			_, data, err := buildSub2APIAgentIdentityAuthFile("import.json", 0, account)
++			if tt.wantErr != "" {
++				if err == nil || err.Error() != tt.wantErr {
++					t.Fatalf("err = %v, want %q", err, tt.wantErr)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected err: %v", err)
++			}
++			if !json.Valid(data) {
++				t.Fatalf("invalid json: %s", data)
++			}
++			if got := string(data); !containsJSONField(got, `"task_id": ""`) {
++				t.Fatalf("task_id missing or non-empty: %s", data)
++			}
++		})
++	}
++}
++
++func TestUploadRawOAuthAndAPIKeyJSONRemainSingleFile(t *testing.T) {
++	authDir := t.TempDir()
++	manager := coreauth.NewManager(nil, nil, nil)
++	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
++	for _, tc := range []struct {
++		name string
++		body []byte
++	}{
++		{name: "codex-oauth.json", body: []byte(`{"type":"codex","email":"user@example.com","access_token":"token"}`)},
++		{name: "codex-key.json", body: []byte(`{"type":"codex","auth_kind":"api_key","api_key":"key"}`)},
++	} {
++		result, err := h.writeUploadedAuthData(context.Background(), tc.name, tc.body)
++		if err != nil {
++			t.Fatalf("write %s: %v", tc.name, err)
++		}
++		if result.IsWrapper || result.Uploaded != 1 || len(result.Files) != 1 || result.Files[0] != tc.name {
++			t.Fatalf("result for %s = %+v", tc.name, result)
++		}
++		if _, errStat := os.Stat(filepath.Join(authDir, tc.name)); errStat != nil {
++			t.Fatalf("expected %s to exist: %v", tc.name, errStat)
++		}
++	}
++}
++
++func containsJSONField(body string, field string) bool {
++	return len(body) >= len(field) && json.Valid([]byte(body)) && strings.Contains(body, field)
++}
 diff --git a/internal/api/handlers/management/auth_files_delete_test.go b/internal/api/handlers/management/auth_files_delete_test.go
 index 1287ab1..d3e9ad9 100644
 --- a/internal/api/handlers/management/auth_files_delete_test.go
@@ -1837,7 +2328,7 @@ index 0000000..17a6d9a
 +	}
 +}
 diff --git a/internal/api/server.go b/internal/api/server.go
-index 7365068..f6858ac 100644
+index 7853c84..7823db3 100644
 --- a/internal/api/server.go
 +++ b/internal/api/server.go
 @@ -32,6 +32,7 @@ import (
@@ -1848,7 +2339,7 @@ index 7365068..f6858ac 100644
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-@@ -84,6 +85,7 @@ type serverOptionConfig struct {
+@@ -88,6 +89,7 @@ type serverOptionConfig struct {
  	postAuthPersistHook   auth.PostAuthHook
  	pluginHost            *pluginhost.Host
  	configReloadHook      func(context.Context, *config.Config)
@@ -1856,7 +2347,7 @@ index 7365068..f6858ac 100644
  	exampleAPIKeySafeMode bool
  }
  
-@@ -184,6 +186,12 @@ func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOpti
+@@ -188,6 +190,12 @@ func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOpti
  	}
  }
  
@@ -1869,7 +2360,7 @@ index 7365068..f6858ac 100644
  // WithExampleAPIKeySafeMode blocks proxy API endpoints while template API keys remain configured.
  func WithExampleAPIKeySafeMode() ServerOption {
  	return func(cfg *serverOptionConfig) {
-@@ -241,6 +249,8 @@ type Server struct {
+@@ -245,6 +253,8 @@ type Server struct {
  	// pluginHost owns dynamic plugin Management API route dispatch.
  	pluginHost *pluginhost.Host
  
@@ -1878,7 +2369,7 @@ index 7365068..f6858ac 100644
  	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
  	managementRoutesRegistered atomic.Bool
  	// managementRoutesEnabled controls whether management endpoints serve real handlers.
-@@ -335,6 +345,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
+@@ -340,6 +350,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
  		envManagementSecret: envManagementSecret,
  		wsRoutes:            make(map[string]struct{}),
  		pluginHost:          optionState.pluginHost,
@@ -1886,7 +2377,7 @@ index 7365068..f6858ac 100644
  
  		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
  	}
-@@ -358,6 +369,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
+@@ -363,6 +374,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
  	// Initialize management handler
  	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
  	s.mgmt.SetPluginHost(optionState.pluginHost)
@@ -1894,7 +2385,7 @@ index 7365068..f6858ac 100644
  	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
  	if optionState.localPassword != "" {
  		s.mgmt.SetLocalPassword(optionState.localPassword)
-@@ -842,6 +854,9 @@ func (s *Server) registerManagementRoutes() {
+@@ -909,6 +921,9 @@ func (s *Server) registerManagementRoutes() {
  		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
  		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
  		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
@@ -1904,7 +2395,7 @@ index 7365068..f6858ac 100644
  
  		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
  		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
-@@ -944,6 +959,8 @@ func (s *Server) registerManagementRoutes() {
+@@ -1011,6 +1026,8 @@ func (s *Server) registerManagementRoutes() {
  		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
  		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
  		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
@@ -1913,7 +2404,7 @@ index 7365068..f6858ac 100644
  		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
  		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
  		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
-@@ -995,6 +1012,17 @@ func (s *Server) RefreshPluginManagementRoutes() {
+@@ -1062,6 +1079,17 @@ func (s *Server) RefreshPluginManagementRoutes() {
  	s.refreshPluginManagementRoutes()
  }
  
@@ -10106,6 +10597,1042 @@ index 0000000..16b3f67
 +		t.Fatal("UsageReported = true, want false")
 +	}
 +}
+diff --git a/internal/runtime/executor/codex_executor.go b/internal/runtime/executor/codex_executor.go
+index 4847fbf..274b12a 100644
+--- a/internal/runtime/executor/codex_executor.go
++++ b/internal/runtime/executor/codex_executor.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -291,6 +292,50 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
+ 
+ func (e *CodexExecutor) Identifier() string { return "codex" }
+ 
++func (e *CodexExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
++	return helps.IsAgentIdentityAuth(auth) && strings.TrimSpace(helps.AuthMetadataString(auth, "task_id")) == ""
++}
++
++func (e *CodexExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
++	if auth == nil || !e.ShouldPrepareRequestAuth(auth) {
++		return auth, nil
++	}
++	return e.registerAgentIdentityTask(ctx, auth)
++}
++
++func (e *CodexExecutor) ShouldRecoverTask(auth *cliproxyauth.Auth, err error) bool {
++	if !helps.IsAgentIdentityAuth(auth) || err == nil {
++		return false
++	}
++	var sc interface{ StatusCode() int }
++	status := 0
++	if errors.As(err, &sc) && sc != nil {
++		status = sc.StatusCode()
++	}
++	return helps.IsAgentIdentityTaskInvalidResponse(status, []byte(err.Error()))
++}
++
++func (e *CodexExecutor) RecoverTask(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
++	if auth == nil || !helps.IsAgentIdentityAuth(auth) {
++		return auth, nil
++	}
++	return e.registerAgentIdentityTask(ctx, auth)
++}
++
++func (e *CodexExecutor) registerAgentIdentityTask(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
++	updated := auth.Clone()
++	client := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
++	taskID, err := helps.RegisterAgentIdentityTask(ctx, client, helps.AgentIdentityAuthAPIBaseURL, updated, time.Now())
++	if err != nil {
++		return auth, err
++	}
++	if updated.Metadata == nil {
++		updated.Metadata = make(map[string]any)
++	}
++	updated.Metadata["task_id"] = taskID
++	return updated, nil
++}
++
+ func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
+ 	if bytes.Equal(originalPayload, payload) {
+ 		body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+@@ -1073,6 +1118,19 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
+ 	if req == nil {
+ 		return nil
+ 	}
++	if helps.IsAgentIdentityAuth(auth) {
++		authHeader, err := buildCodexAgentIdentityAuthorization(auth)
++		if err != nil {
++			return err
++		}
++		req.Header.Set("Authorization", authHeader)
++		var attrs map[string]string
++		if auth != nil {
++			attrs = auth.Attributes
++		}
++		util.ApplyCustomHeadersFromAttrs(req, attrs)
++		return nil
++	}
+ 	apiKey, _ := codexCreds(auth)
+ 	if strings.TrimSpace(apiKey) != "" {
+ 		req.Header.Set("Authorization", "Bearer "+apiKey)
+@@ -1160,7 +1218,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
+ 	if err != nil {
+ 		return resp, err
+ 	}
+-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
++	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
++		return resp, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+@@ -1196,6 +1256,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+ 		b, _ := io.ReadAll(httpResp.Body)
+ 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
++		b = helps.RedactAgentIdentitySecrets(auth, b)
+ 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
+ 			return resp, errClearReplay
+ 		}
+@@ -1315,7 +1376,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
+ 	if err != nil {
+ 		return resp, err
+ 	}
+-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
++	if err = applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
++		return resp, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+@@ -1351,6 +1414,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+ 		b, _ := io.ReadAll(httpResp.Body)
+ 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
++		b = helps.RedactAgentIdentitySecrets(auth, b)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+ 		err = newCodexStatusErr(httpResp.StatusCode, b)
+@@ -1430,7 +1494,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
++	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
++		return nil, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+@@ -1469,6 +1535,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 			return nil, readErr
+ 		}
+ 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
++		data = helps.RedactAgentIdentitySecrets(auth, data)
+ 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
+ 			return nil, errClearReplay
+ 		}
+@@ -1725,6 +1792,9 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
+ 
+ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+ 	log.Debugf("codex executor: refresh called")
++	if helps.IsAgentIdentityAuth(auth) {
++		return auth, nil
++	}
+ 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
+ 		return refreshed, err
+ 	}
+@@ -1948,12 +2018,12 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
+ 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+ }
+ 
+-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
++func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
+ 	var ginHeaders http.Header
+ 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+ 		ginHeaders = ginCtx.Request.Header
+ 	}
+-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
++	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+ }
+ 
+ // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
+@@ -1975,18 +2045,26 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
+ 
+ // applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
+ // Downstream client User-Agent values are not forwarded to reduce Cloudflare 1010 blocks.
+-func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
++func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) error {
+ 	var ginHeaders http.Header
+ 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+ 		ginHeaders = ginCtx.Request.Header.Clone()
+ 		ginHeaders.Del("User-Agent")
+ 	}
+-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
++	return applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+ }
+ 
+-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
++func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) error {
+ 	r.Header.Set("Content-Type", "application/json")
+-	r.Header.Set("Authorization", "Bearer "+token)
++	if helps.IsAgentIdentityAuth(auth) {
++		authHeader, err := buildCodexAgentIdentityAuthorization(auth)
++		if err != nil {
++			return err
++		}
++		r.Header.Set("Authorization", authHeader)
++	} else {
++		r.Header.Set("Authorization", "Bearer "+token)
++	}
+ 
+ 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
+ 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
+@@ -2031,6 +2109,15 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
+ 		attrs = auth.Attributes
+ 	}
+ 	util.ApplyCustomHeadersFromAttrs(r, attrs)
++	return nil
++}
++
++func buildCodexAgentIdentityAuthorization(auth *cliproxyauth.Auth) (string, error) {
++	key, err := helps.AgentIdentityKeyFromAuth(auth)
++	if err != nil {
++		return "", err
++	}
++	return helps.BuildAgentAssertion(key, time.Now())
+ }
+ 
+ func newCodexStatusErr(statusCode int, body []byte) statusErr {
+diff --git a/internal/runtime/executor/codex_openai_images.go b/internal/runtime/executor/codex_openai_images.go
+index 6a514a6..834ef1a 100644
+--- a/internal/runtime/executor/codex_openai_images.go
++++ b/internal/runtime/executor/codex_openai_images.go
+@@ -112,7 +112,9 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
+ 	if errCache != nil {
+ 		return resp, errCache
+ 	}
+-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
++	if err := applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
++		return resp, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, mainModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+@@ -137,12 +139,14 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
+ 		return resp, errRead
+ 	}
+ 	data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
++		data = helps.RedactAgentIdentitySecrets(auth, data)
++		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+ 		err = newCodexStatusErr(httpResp.StatusCode, data)
+ 		return resp, err
+ 	}
++	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 
+ 	outputItemsByIndex := make(map[int64][]byte)
+ 	var outputItemsFallback [][]byte
+@@ -209,7 +213,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
+ 	if errCache != nil {
+ 		return nil, errCache
+ 	}
+-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
++	if err := applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
++		return nil, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, mainModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+@@ -232,6 +238,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
+ 			return nil, errRead
+ 		}
+ 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
++		data = helps.RedactAgentIdentitySecrets(auth, data)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+ 		err = newCodexStatusErr(httpResp.StatusCode, data)
+@@ -336,7 +343,9 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
+ 	if errCache != nil {
+ 		return resp, errCache
+ 	}
+-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg)
++	if err := applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
++		return resp, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, model)
+ 	if contentType != "" {
+ 		httpReq.Header.Set("Content-Type", contentType)
+@@ -364,12 +373,14 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
+ 		return resp, errRead
+ 	}
+ 	data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
++		data = helps.RedactAgentIdentitySecrets(auth, data)
++		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+ 		err = newCodexStatusErr(httpResp.StatusCode, data)
+ 		return resp, err
+ 	}
++	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 
+ 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
+ 	reporter.EnsurePublished(ctx)
+@@ -397,7 +408,9 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
+ 	if errCache != nil {
+ 		return nil, errCache
+ 	}
+-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg)
++	if err := applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
++		return nil, err
++	}
+ 	applyModelHeaderOverrides(httpReq.Header, model)
+ 	if contentType != "" {
+ 		httpReq.Header.Set("Content-Type", contentType)
+@@ -423,6 +436,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
+ 			return nil, errRead
+ 		}
+ 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
++		data = helps.RedactAgentIdentitySecrets(auth, data)
+ 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+ 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+ 		err = newCodexStatusErr(httpResp.StatusCode, data)
+diff --git a/internal/runtime/executor/codex_websockets_executor.go b/internal/runtime/executor/codex_websockets_executor.go
+index 266612c..ae0c0e5 100644
+--- a/internal/runtime/executor/codex_websockets_executor.go
++++ b/internal/runtime/executor/codex_websockets_executor.go
+@@ -358,7 +358,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
+ 	var identityState codexIdentityConfuseState
+ 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+ 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
+-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
++	wsHeaders, err = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
++	if err != nil {
++		return resp, err
++	}
+ 	applyModelHeaderOverrides(wsHeaders, baseModel)
+ 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+ 
+@@ -610,7 +613,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 	var identityState codexIdentityConfuseState
+ 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+ 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
+-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
++	wsHeaders, err = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
++	if err != nil {
++		return nil, err
++	}
+ 	applyModelHeaderOverrides(wsHeaders, baseModel)
+ 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+ 
+@@ -1151,11 +1157,17 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
+ 	return rawJSON, headers, nil
+ }
+ 
+-func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
++func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) (http.Header, error) {
+ 	if headers == nil {
+ 		headers = http.Header{}
+ 	}
+-	if strings.TrimSpace(token) != "" {
++	if helps.IsAgentIdentityAuth(auth) {
++		authHeader, err := buildCodexAgentIdentityAuthorization(auth)
++		if err != nil {
++			return nil, err
++		}
++		headers.Set("Authorization", authHeader)
++	} else if strings.TrimSpace(token) != "" {
+ 		headers.Set("Authorization", "Bearer "+token)
+ 	}
+ 
+@@ -1212,7 +1224,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
+ 	}
+ 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
+ 
+-	return headers
++	return headers, nil
+ }
+ 
+ func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
+diff --git a/internal/runtime/executor/codex_websockets_executor_test.go b/internal/runtime/executor/codex_websockets_executor_test.go
+index 2f3103b..2edeb43 100644
+--- a/internal/runtime/executor/codex_websockets_executor_test.go
++++ b/internal/runtime/executor/codex_websockets_executor_test.go
+@@ -3,6 +3,10 @@ package executor
+ import (
+ 	"bytes"
+ 	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/base64"
+ 	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -791,7 +795,7 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T)
+ }
+ 
+ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
+-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
++	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, nil, "", nil)
+ 
+ 	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
+ 		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
+@@ -825,6 +829,105 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T)
+ 	}
+ }
+ 
++func TestApplyCodexWebsocketHeadersAgentIdentityUsesAgentAssertion(t *testing.T) {
++	encodedPrivateKey := testCodexWebsocketAgentIdentityPrivateKey(t)
++	auth := &cliproxyauth.Auth{
++		Provider: "codex",
++		Metadata: map[string]any{
++			"auth_mode":         "agentIdentity",
++			"agent_runtime_id":  "runtime-test",
++			"agent_private_key": encodedPrivateKey,
++			"task_id":           "task-test",
++		},
++	}
++
++	headers, err := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "bearer-token-should-not-be-used", nil)
++	if err != nil {
++		t.Fatalf("applyCodexWebsocketHeaders: %v", err)
++	}
++	authorization := headers.Get("Authorization")
++	if !strings.HasPrefix(authorization, "AgentAssertion ") {
++		t.Fatalf("Authorization prefix mismatch")
++	}
++	if authorization == "Bearer bearer-token-should-not-be-used" {
++		t.Fatal("Authorization used Bearer token for Agent Identity")
++	}
++	if strings.Contains(authorization, encodedPrivateKey) {
++		t.Fatal("Authorization contains private key")
++	}
++	if strings.Contains(authorization, "bearer-token-should-not-be-used") {
++		t.Fatal("Authorization contains fallback bearer token")
++	}
++}
++
++func TestApplyCodexWebsocketHeadersAgentIdentityMissingCredentialReturnsError(t *testing.T) {
++	encodedPrivateKey := testCodexWebsocketAgentIdentityPrivateKey(t)
++	tests := []struct {
++		name     string
++		metadata map[string]any
++	}{
++		{
++			name: "missing agent_private_key",
++			metadata: map[string]any{
++				"auth_mode":        "agentIdentity",
++				"agent_runtime_id": "runtime-test",
++				"task_id":          "task-test",
++			},
++		},
++		{
++			name: "missing agent_runtime_id",
++			metadata: map[string]any{
++				"auth_mode":         "agentIdentity",
++				"agent_private_key": encodedPrivateKey,
++				"task_id":           "task-test",
++			},
++		},
++		{
++			name: "missing task_id",
++			metadata: map[string]any{
++				"auth_mode":         "agentIdentity",
++				"agent_runtime_id":  "runtime-test",
++				"agent_private_key": encodedPrivateKey,
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			auth := &cliproxyauth.Auth{Provider: "codex", Metadata: tt.metadata}
++			headers, err := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "bearer-token-should-not-be-used", nil)
++			if err == nil {
++				t.Fatal("expected error")
++			}
++			if headers != nil && headers.Get("Authorization") != "" {
++				t.Fatalf("Authorization = %q, want empty on error", headers.Get("Authorization"))
++			}
++		})
++	}
++}
++
++func testCodexWebsocketAgentIdentityPrivateKey(t *testing.T) string {
++	t.Helper()
++	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatalf("GenerateKey: %v", err)
++	}
++	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
++	if err != nil {
++		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
++	}
++	return base64.StdEncoding.EncodeToString(der)
++}
++
++func mustApplyCodexWebsocketHeaders(t *testing.T, ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
++	t.Helper()
++	applied, err := applyCodexWebsocketHeaders(ctx, headers, auth, token, cfg)
++	if err != nil {
++		t.Fatalf("applyCodexWebsocketHeaders: %v", err)
++	}
++	return applied
++}
++
+ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+ 	auth := &cliproxyauth.Auth{
+ 		Provider: "codex",
+@@ -839,7 +942,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
+ 		"session-id":            "legacy-session",
+ 	})
+ 
+-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
++	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", nil)
+ 
+ 	if got := headers.Get("Originator"); got != "Codex Desktop" {
+ 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+@@ -875,7 +978,7 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t
+ 		"Session_id": "legacy-underscore-session",
+ 	})
+ 
+-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
++	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", nil)
+ 
+ 	if got := headers["session_id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
+ 		t.Fatalf("session_id = %#v, want [legacy-underscore-session]", got)
+@@ -897,7 +1000,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
+ 		Metadata: map[string]any{"email": "user@example.com"},
+ 	}
+ 
+-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
++	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "", cfg)
+ 
+ 	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
+ 		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
+@@ -929,7 +1032,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
+ 	headers.Set("User-Agent", "existing-ua")
+ 	headers.Set("X-Codex-Beta-Features", "existing-beta")
+ 
+-	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
++	got := mustApplyCodexWebsocketHeaders(t, ctx, headers, auth, "", cfg)
+ 
+ 	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
+ 		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
+@@ -955,7 +1058,7 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
+ 		"X-Codex-Beta-Features": "client-beta",
+ 	})
+ 
+-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
++	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", cfg)
+ 
+ 	if got := headers.Get("User-Agent"); got != "config-ua" {
+ 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+@@ -977,7 +1080,7 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
+ 		Attributes: map[string]string{"api_key": "sk-test"},
+ 	}
+ 
+-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg)
++	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "sk-test", cfg)
+ 
+ 	if got := headers.Get("User-Agent"); got != "" {
+ 		t.Fatalf("User-Agent = %s, want empty", got)
+@@ -994,7 +1097,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
+ 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+ 	ctx := contextWithGinHeaders(map[string]string{"User-Agent": "api-key-client/1.0", "Originator": "explicit-origin"})
+ 
+-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "sk-test", nil)
++	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "sk-test", nil)
+ 
+ 	if got := headers.Get("User-Agent"); got != "api-key-client/1.0" {
+ 		t.Fatalf("User-Agent = %s, want api-key-client/1.0", got)
+@@ -1007,7 +1110,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
+ func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
+ 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"account_id": "acct-1"}}
+ 
+-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", nil)
++	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "", nil)
+ 
+ 	if got := headerValueCaseInsensitive(headers, "ChatGPT-Account-ID"); got != "acct-1" {
+ 		t.Fatalf("ChatGPT-Account-ID = %s, want acct-1", got)
+@@ -1111,7 +1214,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
+ 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
+ 		"X-Client-Request-Id":   "client-request-1",
+ 	})
+-	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
++	headers = mustApplyCodexWebsocketHeaders(t, ctx, headers, auth, "oauth-token", cfg)
+ 	applyCodexIdentityConfuseHeaders(headers, &identityState)
+ 
+ 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
+@@ -1302,7 +1405,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
+ 		"User-Agent": "client-ua",
+ 	}))
+ 
+-	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
++	_ = applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+ 
+ 	if got := req.Header.Get("User-Agent"); got != "config-ua" {
+ 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+@@ -1328,7 +1431,7 @@ func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
+ 		Metadata: map[string]any{"email": "user@example.com"},
+ 	}
+ 
+-	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
++	_ = applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+ 	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna")
+ 
+ 	if got := req.Header.Get("User-Agent"); got != wantUA {
+@@ -1393,7 +1496,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+ 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
+ 	}))
+ 
+-	applyCodexHeaders(req, auth, "oauth-token", true, nil)
++	_ = applyCodexHeaders(req, auth, "oauth-token", true, nil)
+ 
+ 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
+ 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+@@ -1415,7 +1518,7 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T)
+ 		t.Fatalf("NewRequest() error = %v", err)
+ 	}
+ 
+-	applyCodexHeaders(req, nil, "oauth-token", true, nil)
++	_ = applyCodexHeaders(req, nil, "oauth-token", true, nil)
+ 
+ 	if got := req.Header.Get("Version"); got != "" {
+ 		t.Fatalf("Version = %q, want empty", got)
+diff --git a/internal/runtime/executor/helps/agent_identity.go b/internal/runtime/executor/helps/agent_identity.go
+new file mode 100644
+index 0000000..7c36c1f
+--- /dev/null
++++ b/internal/runtime/executor/helps/agent_identity.go
+@@ -0,0 +1,241 @@
++package helps
++
++import (
++	"bytes"
++	"context"
++	"crypto/ed25519"
++	"crypto/sha512"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	"golang.org/x/crypto/curve25519"
++	"golang.org/x/crypto/nacl/box"
++)
++
++const (
++	OpenAIAuthModeAgentIdentity = "agentIdentity"
++	AgentIdentityAuthAPIBaseURL = "https://auth.openai.com/api/accounts"
++)
++
++type AgentIdentityTaskRegistrationResponse struct {
++	TaskID               string `json:"task_id"`
++	TaskIDCamel          string `json:"taskId"`
++	EncryptedTaskID      string `json:"encrypted_task_id"`
++	EncryptedTaskIDCamel string `json:"encryptedTaskId"`
++}
++
++type AgentIdentityKey struct {
++	RuntimeID  string
++	PrivateKey ed25519.PrivateKey
++	TaskID     string
++}
++
++func IsAgentIdentityAuth(auth *cliproxyauth.Auth) bool {
++	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
++		return false
++	}
++	return strings.EqualFold(AuthMetadataString(auth, "auth_mode"), OpenAIAuthModeAgentIdentity)
++}
++
++func AuthMetadataString(auth *cliproxyauth.Auth, key string) string {
++	if auth == nil || auth.Metadata == nil {
++		return ""
++	}
++	if value, ok := auth.Metadata[key].(string); ok {
++		return strings.TrimSpace(value)
++	}
++	return ""
++}
++
++func AgentIdentityKeyFromAuth(auth *cliproxyauth.Auth) (AgentIdentityKey, error) {
++	if auth == nil {
++		return AgentIdentityKey{}, errors.New("agent identity auth is nil")
++	}
++	raw := AuthMetadataString(auth, "agent_private_key")
++	if raw == "" {
++		return AgentIdentityKey{}, errors.New("agent identity private key is missing")
++	}
++	der, err := base64.StdEncoding.DecodeString(raw)
++	if err != nil {
++		return AgentIdentityKey{}, errors.New("agent identity private key is not valid base64")
++	}
++	key, err := x509.ParsePKCS8PrivateKey(der)
++	if err != nil {
++		return AgentIdentityKey{}, errors.New("agent identity private key is not valid PKCS#8")
++	}
++	privateKey, ok := key.(ed25519.PrivateKey)
++	if !ok || len(privateKey) != ed25519.PrivateKeySize {
++		return AgentIdentityKey{}, errors.New("agent identity private key is not Ed25519")
++	}
++	runtimeID := AuthMetadataString(auth, "agent_runtime_id")
++	if runtimeID == "" {
++		return AgentIdentityKey{}, errors.New("agent identity runtime id is missing")
++	}
++	return AgentIdentityKey{RuntimeID: runtimeID, PrivateKey: privateKey, TaskID: AuthMetadataString(auth, "task_id")}, nil
++}
++
++func BuildAgentAssertion(key AgentIdentityKey, now time.Time) (string, error) {
++	if strings.TrimSpace(key.RuntimeID) == "" || strings.TrimSpace(key.TaskID) == "" {
++		return "", errors.New("agent identity runtime or task id is missing")
++	}
++	timestamp := now.UTC().Format(time.RFC3339)
++	payload := []byte(key.RuntimeID + ":" + key.TaskID + ":" + timestamp)
++	signature := ed25519.Sign(key.PrivateKey, payload)
++	envelope := map[string]string{
++		"agent_runtime_id": key.RuntimeID,
++		"task_id":          key.TaskID,
++		"timestamp":        timestamp,
++		"signature":        base64.StdEncoding.EncodeToString(signature),
++	}
++	encoded, err := json.Marshal(envelope)
++	if err != nil {
++		return "", errors.New("failed to serialize agent assertion")
++	}
++	return "AgentAssertion " + base64.RawURLEncoding.EncodeToString(encoded), nil
++}
++
++func SignAgentTaskRegistration(key AgentIdentityKey, now time.Time) (string, string, error) {
++	if strings.TrimSpace(key.RuntimeID) == "" {
++		return "", "", errors.New("agent identity runtime id is missing")
++	}
++	timestamp := now.UTC().Format(time.RFC3339)
++	signature := ed25519.Sign(key.PrivateKey, []byte(key.RuntimeID+":"+timestamp))
++	return timestamp, base64.StdEncoding.EncodeToString(signature), nil
++}
++
++func DecryptAgentTaskID(key AgentIdentityKey, encoded string) (string, error) {
++	ciphertext, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
++	if err != nil {
++		return "", errors.New("encrypted agent task id is not valid base64")
++	}
++	digest := sha512.Sum512(key.PrivateKey.Seed())
++	var curvePrivate [32]byte
++	copy(curvePrivate[:], digest[:32])
++	curvePrivate[0] &= 248
++	curvePrivate[31] &= 127
++	curvePrivate[31] |= 64
++	curvePublicBytes, err := curve25519.X25519(curvePrivate[:], curve25519.Basepoint)
++	if err != nil {
++		return "", errors.New("failed to derive agent identity decryption key")
++	}
++	var curvePublic [32]byte
++	copy(curvePublic[:], curvePublicBytes)
++	plaintext, ok := box.OpenAnonymous(nil, ciphertext, &curvePublic, &curvePrivate)
++	if !ok {
++		return "", errors.New("failed to decrypt encrypted agent task id")
++	}
++	taskID := strings.TrimSpace(string(plaintext))
++	if taskID == "" {
++		return "", errors.New("decrypted agent task id is empty")
++	}
++	return taskID, nil
++}
++
++func RegisterAgentIdentityTask(ctx context.Context, client *http.Client, baseURL string, auth *cliproxyauth.Auth, now time.Time) (string, error) {
++	key, err := AgentIdentityKeyFromAuth(auth)
++	if err != nil {
++		return "", err
++	}
++	timestamp, signature, err := SignAgentTaskRegistration(key, now)
++	if err != nil {
++		return "", err
++	}
++	if client == nil {
++		client = http.DefaultClient
++	}
++	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
++	if baseURL == "" {
++		baseURL = AgentIdentityAuthAPIBaseURL
++	}
++	body, err := json.Marshal(map[string]string{"timestamp": timestamp, "signature": signature})
++	if err != nil {
++		return "", errors.New("failed to serialize agent task registration")
++	}
++	url := baseURL + "/v1/agent/" + key.RuntimeID + "/task/register"
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
++	if err != nil {
++		return "", errors.New("failed to build agent task registration request")
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", errors.New("agent task registration request failed")
++	}
++	defer func() { _ = resp.Body.Close() }()
++	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
++		return "", fmt.Errorf("agent task registration returned status %d", resp.StatusCode)
++	}
++	var result AgentIdentityTaskRegistrationResponse
++	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&result); err != nil {
++		return "", errors.New("agent task registration response is invalid")
++	}
++	if taskID := strings.TrimSpace(result.TaskID); taskID != "" {
++		return taskID, nil
++	}
++	if taskID := strings.TrimSpace(result.TaskIDCamel); taskID != "" {
++		return taskID, nil
++	}
++	encrypted := strings.TrimSpace(result.EncryptedTaskID)
++	if encrypted == "" {
++		encrypted = strings.TrimSpace(result.EncryptedTaskIDCamel)
++	}
++	if encrypted == "" {
++		return "", errors.New("agent task registration response omitted task id")
++	}
++	return DecryptAgentTaskID(key, encrypted)
++}
++
++func IsAgentIdentityTaskInvalidResponse(statusCode int, body []byte) bool {
++	if statusCode != http.StatusUnauthorized {
++		return false
++	}
++	lower := strings.ToLower(string(body))
++	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(lower)
++	for _, marker := range []string{`"code":"invalid_task_id"`, `"error":"invalid_task_id"`} {
++		if strings.Contains(compact, marker) {
++			return true
++		}
++	}
++	for _, marker := range []string{"invalid task_id", "task_id is invalid", "unknown task_id"} {
++		if strings.Contains(lower, marker) {
++			return true
++		}
++	}
++	return false
++}
++
++func RedactAgentIdentitySecrets(auth *cliproxyauth.Auth, body []byte) []byte {
++	if !IsAgentIdentityAuth(auth) || len(body) == 0 {
++		return body
++	}
++	redacted := string(body)
++	for _, key := range []string{"agent_private_key", "id_token", "task_id", "access_token", "refresh_token", "api_key"} {
++		if value := AuthMetadataString(auth, key); value != "" {
++			redacted = strings.ReplaceAll(redacted, value, "[redacted]")
++		}
++	}
++	const prefix = "AgentAssertion "
++	for offset := 0; offset < len(redacted); {
++		idx := strings.Index(redacted[offset:], prefix)
++		if idx < 0 {
++			break
++		}
++		start := offset + idx + len(prefix)
++		end := start
++		for end < len(redacted) && !strings.ContainsRune(" \t\r\n\"',}", rune(redacted[end])) {
++			end++
++		}
++		redacted = redacted[:start] + "[redacted]" + redacted[end:]
++		offset = start + len("[redacted]")
++	}
++	return []byte(redacted)
++}
+diff --git a/internal/runtime/executor/helps/agent_identity_test.go b/internal/runtime/executor/helps/agent_identity_test.go
+new file mode 100644
+index 0000000..50856f9
+--- /dev/null
++++ b/internal/runtime/executor/helps/agent_identity_test.go
+@@ -0,0 +1,171 @@
++package helps
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/sha512"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	"golang.org/x/crypto/curve25519"
++	"golang.org/x/crypto/nacl/box"
++)
++
++func newTestAgentIdentityAuth(t *testing.T) (*cliproxyauth.Auth, ed25519.PrivateKey, string) {
++	t.Helper()
++	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatalf("GenerateKey: %v", err)
++	}
++	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
++	if err != nil {
++		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
++	}
++	encoded := base64.StdEncoding.EncodeToString(der)
++	return &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{
++		"auth_mode":         OpenAIAuthModeAgentIdentity,
++		"agent_runtime_id":  "runtime-test",
++		"agent_private_key": encoded,
++		"task_id":           "task-test",
++	}}, privateKey, encoded
++}
++
++func TestBuildAgentAssertionUsesRFC3339TimestampAndRuntimeTaskPayload(t *testing.T) {
++	auth, privateKey, encodedKey := newTestAgentIdentityAuth(t)
++	key, err := AgentIdentityKeyFromAuth(auth)
++	if err != nil {
++		t.Fatalf("AgentIdentityKeyFromAuth: %v", err)
++	}
++	now := time.Date(2026, 7, 23, 9, 10, 11, 0, time.FixedZone("UTC+8", 8*60*60))
++	assertion, err := BuildAgentAssertion(key, now)
++	if err != nil {
++		t.Fatalf("BuildAgentAssertion: %v", err)
++	}
++	if !strings.HasPrefix(assertion, "AgentAssertion ") {
++		t.Fatalf("assertion prefix = %q", assertion)
++	}
++	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(assertion, "AgentAssertion "))
++	if err != nil {
++		t.Fatalf("DecodeString: %v", err)
++	}
++	if strings.Contains(string(decoded), encodedKey) {
++		t.Fatal("assertion leaked private key")
++	}
++	var envelope struct {
++		RuntimeID string `json:"agent_runtime_id"`
++		TaskID    string `json:"task_id"`
++		Timestamp string `json:"timestamp"`
++		Signature string `json:"signature"`
++	}
++	if err := json.Unmarshal(decoded, &envelope); err != nil {
++		t.Fatalf("Unmarshal: %v", err)
++	}
++	if envelope.Timestamp != "2026-07-23T01:10:11Z" {
++		t.Fatalf("timestamp = %q", envelope.Timestamp)
++	}
++	signature, err := base64.StdEncoding.DecodeString(envelope.Signature)
++	if err != nil {
++		t.Fatalf("signature decode: %v", err)
++	}
++	if !ed25519.Verify(privateKey.Public().(ed25519.PublicKey), []byte("runtime-test:task-test:2026-07-23T01:10:11Z"), signature) {
++		t.Fatal("signature did not verify runtimeID:taskID:timestamp payload")
++	}
++}
++
++func TestSignAgentTaskRegistrationUsesRuntimeTimestampPayload(t *testing.T) {
++	auth, privateKey, _ := newTestAgentIdentityAuth(t)
++	key, err := AgentIdentityKeyFromAuth(auth)
++	if err != nil {
++		t.Fatalf("AgentIdentityKeyFromAuth: %v", err)
++	}
++	timestamp, signatureRaw, err := SignAgentTaskRegistration(key, time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC))
++	if err != nil {
++		t.Fatalf("SignAgentTaskRegistration: %v", err)
++	}
++	signature, err := base64.StdEncoding.DecodeString(signatureRaw)
++	if err != nil {
++		t.Fatalf("signature decode: %v", err)
++	}
++	if !ed25519.Verify(privateKey.Public().(ed25519.PublicKey), []byte("runtime-test:"+timestamp), signature) {
++		t.Fatal("registration signature did not verify runtimeID:timestamp payload")
++	}
++}
++
++func TestRegisterAgentIdentityTaskAcceptsPlainAndEncryptedTaskID(t *testing.T) {
++	auth, privateKey, _ := newTestAgentIdentityAuth(t)
++	requests := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests++
++		if r.URL.Path != "/v1/agent/runtime-test/task/register" {
++			t.Fatalf("path = %q", r.URL.Path)
++		}
++		if r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" {
++			t.Fatalf("headers = %#v", r.Header)
++		}
++		body, _ := io.ReadAll(r.Body)
++		if !strings.Contains(string(body), "timestamp") || !strings.Contains(string(body), "signature") {
++			t.Fatalf("body = %s", body)
++		}
++		if requests == 1 {
++			_, _ = w.Write([]byte(`{"task_id":"task-plain"}`))
++			return
++		}
++		digest := sha512.Sum512(privateKey.Seed())
++		var curvePrivate [32]byte
++		copy(curvePrivate[:], digest[:32])
++		curvePrivate[0] &= 248
++		curvePrivate[31] &= 127
++		curvePrivate[31] |= 64
++		curvePublicBytes, err := curve25519.X25519(curvePrivate[:], curve25519.Basepoint)
++		if err != nil {
++			t.Fatalf("X25519: %v", err)
++		}
++		var curvePublic [32]byte
++		copy(curvePublic[:], curvePublicBytes)
++		ciphertext, err := box.SealAnonymous(nil, []byte("task-encrypted"), &curvePublic, rand.Reader)
++		if err != nil {
++			t.Fatalf("SealAnonymous: %v", err)
++		}
++		_, _ = w.Write([]byte(`{"encryptedTaskId":"` + base64.StdEncoding.EncodeToString(ciphertext) + `"}`))
++	}))
++	defer server.Close()
++
++	got, err := RegisterAgentIdentityTask(context.Background(), server.Client(), server.URL, auth, time.Now())
++	if err != nil || got != "task-plain" {
++		t.Fatalf("plain task = %q, err=%v", got, err)
++	}
++	got, err = RegisterAgentIdentityTask(context.Background(), server.Client(), server.URL, auth, time.Now())
++	if err != nil || got != "task-encrypted" {
++		t.Fatalf("encrypted task = %q, err=%v", got, err)
++	}
++}
++
++func TestIsAgentIdentityTaskInvalidResponseIsNarrow(t *testing.T) {
++	valid := [][]byte{
++		[]byte(`{"error":{"code":"invalid_task_id"}}`),
++		[]byte(`{"error":"invalid_task_id"}`),
++		[]byte(`invalid task_id`),
++		[]byte(`task_id is invalid`),
++		[]byte(`unknown task_id`),
++	}
++	for _, body := range valid {
++		if !IsAgentIdentityTaskInvalidResponse(http.StatusUnauthorized, body) {
++			t.Fatalf("expected invalid task match for %s", body)
++		}
++	}
++	if IsAgentIdentityTaskInvalidResponse(http.StatusUnauthorized, []byte(`{"error":{"code":"auth_unavailable"}}`)) {
++		t.Fatal("ordinary 401 matched invalid task")
++	}
++	if IsAgentIdentityTaskInvalidResponse(http.StatusForbidden, []byte(`{"error":{"code":"invalid_task_id"}}`)) {
++		t.Fatal("non-401 matched invalid task")
++	}
++}
 diff --git a/internal/runtime/executor/helps/usage_helpers.go b/internal/runtime/executor/helps/usage_helpers.go
 index c4b8d82..cab35c9 100644
 --- a/internal/runtime/executor/helps/usage_helpers.go
@@ -10266,25 +11793,25 @@ index c54b38e..06d3ff6 100644
  	reporter := NewExecutorUsageReporter(context.Background(), &TestUsageExecutor{}, "gpt-5.4", nil)
  
 diff --git a/sdk/api/handlers/openai/openai_responses_websocket.go b/sdk/api/handlers/openai/openai_responses_websocket.go
-index d9cd119..1e26e85 100644
+index 11ffcb0..53a1de3 100644
 --- a/sdk/api/handlers/openai/openai_responses_websocket.go
 +++ b/sdk/api/handlers/openai/openai_responses_websocket.go
-@@ -458,7 +458,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+@@ -653,7 +653,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
  			}
  		}
  		if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
--			pinnedAuthID = ""
+-			forgetPinnedAuth()
 +			releasePinnedAuth := true
 +			if responsesWebsocketErrorStatus(forwardErrMsg) == http.StatusTooManyRequests {
 +				releasePinnedAuth = responsesWebsocketPinnedAuthQuotaCooling(h.AuthManager, pinnedAuthID, modelName, time.Now())
 +			}
 +			if releasePinnedAuth {
-+				pinnedAuthID = ""
++				forgetPinnedAuth()
 +			}
  			forceTranscriptReplayNextRequest = true
  			if useUpstreamWebsocketPassthrough {
  				passthroughModelName = ""
-@@ -1499,12 +1505,7 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
+@@ -1720,12 +1726,7 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
  	if errMsg == nil {
  		return false
  	}
@@ -10298,7 +11825,7 @@ index d9cd119..1e26e85 100644
  	switch status {
  	case http.StatusUnauthorized,
  		http.StatusPaymentRequired,
-@@ -1531,6 +1532,48 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
+@@ -1752,6 +1753,48 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage)
  	return false
  }
  
@@ -10348,10 +11875,10 @@ index d9cd119..1e26e85 100644
  	if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
  		return
 diff --git a/sdk/api/handlers/openai/openai_responses_websocket_test.go b/sdk/api/handlers/openai/openai_responses_websocket_test.go
-index 4cd522e..8982a85 100644
+index 4f093f4..755cf7b 100644
 --- a/sdk/api/handlers/openai/openai_responses_websocket_test.go
 +++ b/sdk/api/handlers/openai/openai_responses_websocket_test.go
-@@ -367,7 +367,7 @@ func (e *websocketPinnedFailoverExecutor) ExecuteStream(_ context.Context, auth
+@@ -643,7 +643,7 @@ func (e *websocketPinnedFailoverExecutor) ExecuteStream(_ context.Context, auth
  	e.payloads[authID] = append(e.payloads[authID], bytes.Clone(req.Payload))
  	e.mu.Unlock()
  
@@ -10360,7 +11887,7 @@ index 4cd522e..8982a85 100644
  		chunks := make(chan coreexecutor.StreamChunk, 1)
  		chunks <- coreexecutor.StreamChunk{Err: websocketPinnedFailoverStatusError{
  			status: http.StatusTooManyRequests,
-@@ -2552,12 +2552,14 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+@@ -3146,12 +3146,14 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
  		}
  	}()
  
@@ -10380,7 +11907,7 @@ index 4cd522e..8982a85 100644
  	for i := range requests {
  		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(requests[i])); errWrite != nil {
  			t.Fatalf("write websocket message %d: %v", i+1, errWrite)
-@@ -2569,13 +2571,22 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+@@ -3163,13 +3165,22 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
  		if got := gjson.GetBytes(payload, "type").String(); got != wantTypes[i] {
  			t.Fatalf("message %d payload type = %s, want %s: %s", i+1, got, wantTypes[i], payload)
  		}
@@ -10407,7 +11934,7 @@ index 4cd522e..8982a85 100644
  	}
  
  	authBPayloads := executor.Payloads("auth-b")
-@@ -2587,7 +2598,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+@@ -3181,7 +3192,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
  		t.Fatalf("previous_response_id leaked after auth failover: %s", authBPayload)
  	}
  	authBInput := gjson.GetBytes(authBPayload, "input").Raw
@@ -10416,8 +11943,21 @@ index 4cd522e..8982a85 100644
  		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
  	}
  }
+diff --git a/sdk/cliproxy/auth/classification.go b/sdk/cliproxy/auth/classification.go
+index b8c7171..e6454e1 100644
+--- a/sdk/cliproxy/auth/classification.go
++++ b/sdk/cliproxy/auth/classification.go
+@@ -107,7 +107,7 @@ func authHasOAuthMetadata(auth *Auth) bool {
+ 	if auth == nil || len(auth.Metadata) == 0 {
+ 		return false
+ 	}
+-	for _, key := range []string{"access_token", "refresh_token", "id_token", "email", "token_type", "expires_at", "expired"} {
++	for _, key := range []string{"access_token", "refresh_token", "id_token", "email", "token_type", "expires_at", "expired", "auth_mode", "agent_runtime_id", "agent_private_key"} {
+ 		if authMetadataString(auth, key) != "" {
+ 			return true
+ 		}
 diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
-index fedf495..18d160b 100644
+index 716a664..d5e46ea 100644
 --- a/sdk/cliproxy/auth/conductor.go
 +++ b/sdk/cliproxy/auth/conductor.go
 @@ -29,6 +29,7 @@ import (
@@ -10428,7 +11968,21 @@ index fedf495..18d160b 100644
  	"github.com/tidwall/sjson"
  )
  
-@@ -86,9 +87,22 @@ const (
+@@ -57,6 +58,13 @@ type RequestAuthPreparer interface {
+ 	PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error)
+ }
+ 
++// TaskRecoverer lets an executor repair request-scoped credential state after
++// an upstream response proves that a stored task identifier is invalid.
++type TaskRecoverer interface {
++	ShouldRecoverTask(auth *Auth, err error) bool
++	RecoverTask(ctx context.Context, auth *Auth) (*Auth, error)
++}
++
+ // ExecutionSessionCloser allows executors to release per-session runtime resources.
+ type ExecutionSessionCloser interface {
+ 	CloseExecutionSession(sessionID string)
+@@ -86,9 +94,22 @@ const (
  	refreshIneffectiveBackoff = 30 * time.Second
  	quotaBackoffBase          = time.Second
  	quotaBackoffMax           = 30 * time.Minute
@@ -10451,7 +12005,7 @@ index fedf495..18d160b 100644
  var quotaCooldownDisabled atomic.Bool
  var transientErrorCooldownSeconds atomic.Int64
  
-@@ -3743,7 +3757,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+@@ -3755,7 +3776,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
  				clearAuthStateOnSuccess(auth, now)
  			}
  		} else {
@@ -10464,7 +12018,7 @@ index fedf495..18d160b 100644
  				if !isRequestScopedResultError(result.Error) {
  					disableCooling := m.cooldownDisabledForAuth(auth)
  					state := ensureModelState(auth, result.Model)
-@@ -3758,7 +3776,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+@@ -3770,7 +3795,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
  					}
  
  					statusCode := statusCodeFromResult(result.Error)
@@ -10483,7 +12037,7 @@ index fedf495..18d160b 100644
  						next := now.Add(12 * time.Hour)
  						state.NextRetryAfter = next
  						suspendReason = "model_not_supported"
-@@ -3814,23 +3842,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+@@ -3826,23 +3861,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
  								shouldSuspendModel = true
  							}
  						case 429:
@@ -10512,7 +12066,7 @@ index fedf495..18d160b 100644
  								suspendReason = "quota"
  								shouldSuspendModel = true
  								setModelQuota = true
-@@ -4352,6 +4373,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+@@ -4587,6 +4615,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
  		}
  	}
  	statusCode := statusCodeFromResult(resultErr)
@@ -10524,7 +12078,7 @@ index fedf495..18d160b 100644
  	if isCloudflareChallengeResultError(resultErr) {
  		auth.StatusMessage = "cloudflare challenge"
  		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
-@@ -4397,16 +4423,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+@@ -4632,16 +4665,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
  		}
  	case 429:
  		auth.StatusMessage = "quota exhausted"
@@ -10549,7 +12103,7 @@ index fedf495..18d160b 100644
  		auth.Quota.NextRecoverAt = next
  		auth.NextRetryAfter = next
  	case 408, 500, 502, 503, 504:
-@@ -4423,6 +4448,123 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+@@ -4658,6 +4690,123 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
  	}
  }
  
@@ -10673,7 +12227,7 @@ index fedf495..18d160b 100644
  // quotaCooldownAfterFailure returns the recovery deadline and backoff level for
  // a quota failure observed at now. Failures that land while a previous quota
  // window is still open reuse that window instead of escalating, so a burst of
-@@ -4440,6 +4582,52 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int)
+@@ -4675,6 +4824,52 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int)
  	return next, nextLevel
  }
  
@@ -10726,7 +12280,51 @@ index fedf495..18d160b 100644
  // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
  func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
  	if prevLevel < 0 {
-@@ -5997,16 +6185,22 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
+@@ -6164,6 +6359,9 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
+ 	if m == nil || auth == nil || alreadyTried || execErr == nil {
+ 		return auth, false
+ 	}
++	if recovered, okRecover := m.tryRecoverTaskAfterError(ctx, auth, execErr); okRecover {
++		return recovered, true
++	}
+ 	if !isUnauthorizedError(execErr) || !authHasRefreshCredential(auth) {
+ 		return auth, false
+ 	}
+@@ -6176,6 +6374,33 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
+ 	return refreshed, true
+ }
+ 
++func (m *Manager) tryRecoverTaskAfterError(ctx context.Context, auth *Auth, execErr error) (*Auth, bool) {
++	if m == nil || auth == nil || execErr == nil {
++		return auth, false
++	}
++	m.mu.RLock()
++	exec := m.executors[executorKeyFromAuth(auth)]
++	m.mu.RUnlock()
++	recoverer, ok := exec.(TaskRecoverer)
++	if !ok || recoverer == nil || !recoverer.ShouldRecoverTask(auth, execErr) {
++		return auth, false
++	}
++	updated, errRecover := recoverer.RecoverTask(ctx, auth.Clone())
++	if errRecover != nil || updated == nil {
++		log.Debugf("task recovery before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errRecover)
++		return auth, false
++	}
++	saved, errUpdate := m.Update(ctx, updated)
++	if errUpdate != nil {
++		log.Debugf("persist task recovery before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errUpdate)
++		return updated, true
++	}
++	if saved != nil {
++		return saved, true
++	}
++	return updated, true
++}
++
+ func (m *Manager) refreshAuth(ctx context.Context, id string) {
+ 	_, _ = m.refreshAuthForRequest(ctx, id, "")
+ }
+@@ -6232,16 +6457,22 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
  	now := time.Now()
  	if err != nil {
  		unauthorized := isUnauthorizedError(err)
@@ -11313,7 +12911,7 @@ index 0329651..3fa5024 100644
  	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
  	if errPick != nil {
 diff --git a/sdk/cliproxy/service.go b/sdk/cliproxy/service.go
-index 61c6dad..c95773e 100644
+index 50b3822..8541230 100644
 --- a/sdk/cliproxy/service.go
 +++ b/sdk/cliproxy/service.go
 @@ -17,6 +17,7 @@ import (
@@ -11324,7 +12922,7 @@ index 61c6dad..c95773e 100644
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
  	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-@@ -99,6 +100,9 @@ type Service struct {
+@@ -100,6 +101,9 @@ type Service struct {
  	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
  	pluginHost *pluginhost.Host
  
@@ -11334,7 +12932,7 @@ index 61c6dad..c95773e 100644
  	// shutdownOnce ensures shutdown is called only once.
  	shutdownOnce sync.Once
  
-@@ -788,6 +792,29 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
+@@ -790,6 +794,29 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
  	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
  }
  
@@ -11364,7 +12962,7 @@ index 61c6dad..c95773e 100644
  func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
  	if cfg == nil {
  		return "", nil
-@@ -1322,8 +1349,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
+@@ -1324,8 +1351,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
  
  	s.applyRetryConfig(newCfg)
  	s.configureCooldownStateStore(newCfg)
@@ -11375,7 +12973,7 @@ index 61c6dad..c95773e 100644
  		s.server.UpdateClients(newCfg)
  	}
  	s.cfgMu.Lock()
-@@ -1637,6 +1666,7 @@ func (s *Service) Run(ctx context.Context) error {
+@@ -1644,6 +1673,7 @@ func (s *Service) Run(ctx context.Context) error {
  
  	s.applyRetryConfig(s.cfg)
  	s.configureCooldownStateStore(s.cfg)
@@ -11383,7 +12981,7 @@ index 61c6dad..c95773e 100644
  
  	s.registerPluginAuthParser()
  	if s.coreManager != nil && !homeEnabled {
-@@ -1681,7 +1711,9 @@ func (s *Service) Run(ctx context.Context) error {
+@@ -1688,7 +1718,9 @@ func (s *Service) Run(ctx context.Context) error {
  	}
  
  	// handlers no longer depend on legacy clients; pass nil slice initially
@@ -11394,7 +12992,7 @@ index 61c6dad..c95773e 100644
  	s.syncPluginRuntimeConfig(ctx)
  	if homeEnabled {
  		s.syncPluginModelRuntime(ctx)
-@@ -1878,7 +1910,29 @@ func (s *Service) Shutdown(ctx context.Context) error {
+@@ -1885,7 +1917,29 @@ func (s *Service) Shutdown(ctx context.Context) error {
  			}
  		}
  
@@ -11809,3 +13407,4 @@ index 6f7b1fb..6f70c8a 100644
 +		t.Fatalf("plugin handled record after unregister")
  	}
  }
+

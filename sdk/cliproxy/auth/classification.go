@@ -107,7 +107,7 @@ func authHasOAuthMetadata(auth *Auth) bool {
 	if auth == nil || len(auth.Metadata) == 0 {
 		return false
 	}
-	for _, key := range []string{"access_token", "refresh_token", "id_token", "email", "token_type", "expires_at", "expired"} {
+	for _, key := range []string{"access_token", "refresh_token", "id_token", "email", "token_type", "expires_at", "expired", "auth_mode", "agent_runtime_id", "agent_private_key"} {
 		if authMetadataString(auth, key) != "" {
 			return true
 		}

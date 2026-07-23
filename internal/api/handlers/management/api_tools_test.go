@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,48 +29,6 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
-	}
-}
-
-func TestAntigravityOAuthClientCredentialsPreferMetadata(t *testing.T) {
-	t.Setenv(antigravityOAuthClientIDEnv, "env-client-id")
-	t.Setenv(antigravityOAuthClientSecretEnv, "env-client-secret")
-
-	clientID, clientSecret, err := antigravityOAuthClientCredentials(map[string]any{
-		"client_id":     " metadata-client-id ",
-		"client_secret": " metadata-client-secret ",
-	})
-	if err != nil {
-		t.Fatalf("credentials error: %v", err)
-	}
-	if clientID != "metadata-client-id" || clientSecret != "metadata-client-secret" {
-		t.Fatalf("credentials = %q/%q, want metadata values", clientID, clientSecret)
-	}
-}
-
-func TestAntigravityOAuthClientCredentialsUseEnv(t *testing.T) {
-	t.Setenv(antigravityOAuthClientIDEnv, "env-client-id")
-	t.Setenv(antigravityOAuthClientSecretEnv, "env-client-secret")
-
-	clientID, clientSecret, err := antigravityOAuthClientCredentials(nil)
-	if err != nil {
-		t.Fatalf("credentials error: %v", err)
-	}
-	if clientID != "env-client-id" || clientSecret != "env-client-secret" {
-		t.Fatalf("credentials = %q/%q, want env values", clientID, clientSecret)
-	}
-}
-
-func TestAntigravityOAuthClientCredentialsRequireBoth(t *testing.T) {
-	t.Setenv(antigravityOAuthClientIDEnv, "")
-	t.Setenv(antigravityOAuthClientSecretEnv, "")
-
-	_, _, err := antigravityOAuthClientCredentials(map[string]any{"client_id": "metadata-client-id"})
-	if err == nil {
-		t.Fatal("expected missing credentials error")
-	}
-	if !strings.Contains(err.Error(), antigravityOAuthClientSecretEnv) {
-		t.Fatalf("error = %q, want missing secret env hint", err.Error())
 	}
 }
 

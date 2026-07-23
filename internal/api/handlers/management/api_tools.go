@@ -24,9 +24,9 @@ import (
 
 const defaultAPICallTimeout = 60 * time.Second
 
-const (
-	antigravityOAuthClientIDEnv     = "ANTIGRAVITY_OAUTH_CLIENT_ID"
-	antigravityOAuthClientSecretEnv = "ANTIGRAVITY_OAUTH_CLIENT_SECRET"
+var (
+	antigravityOAuthClientID     = strings.TrimSpace(os.Getenv("CPA_ANTIGRAVITY_OAUTH_CLIENT_ID"))
+	antigravityOAuthClientSecret = strings.TrimSpace(os.Getenv("CPA_ANTIGRAVITY_OAUTH_CLIENT_SECRET"))
 )
 
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
@@ -491,13 +491,9 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	if tokenURL == "" {
 		tokenURL = "https://oauth2.googleapis.com/token"
 	}
-	clientID, clientSecret, errCredentials := antigravityOAuthClientCredentials(metadata)
-	if errCredentials != nil {
-		return "", errCredentials
-	}
 	form := url.Values{}
-	form.Set("client_id", clientID)
-	form.Set("client_secret", clientSecret)
+	form.Set("client_id", antigravityOAuthClientID)
+	form.Set("client_secret", antigravityOAuthClientSecret)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 
@@ -631,35 +627,6 @@ func stringValue(metadata map[string]any, key string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
-}
-
-func antigravityOAuthClientCredentials(metadata map[string]any) (string, string, error) {
-	clientID := strings.TrimSpace(stringValue(metadata, "client_id"))
-	if clientID == "" {
-		clientID = strings.TrimSpace(stringValue(metadata, "clientId"))
-	}
-	if clientID == "" {
-		clientID = strings.TrimSpace(stringValue(metadata, "oauth_client_id"))
-	}
-	if clientID == "" {
-		clientID = strings.TrimSpace(os.Getenv(antigravityOAuthClientIDEnv))
-	}
-
-	clientSecret := strings.TrimSpace(stringValue(metadata, "client_secret"))
-	if clientSecret == "" {
-		clientSecret = strings.TrimSpace(stringValue(metadata, "clientSecret"))
-	}
-	if clientSecret == "" {
-		clientSecret = strings.TrimSpace(stringValue(metadata, "oauth_client_secret"))
-	}
-	if clientSecret == "" {
-		clientSecret = strings.TrimSpace(os.Getenv(antigravityOAuthClientSecretEnv))
-	}
-
-	if clientID == "" || clientSecret == "" {
-		return "", "", fmt.Errorf("antigravity oauth client credentials missing: set metadata client_id/client_secret or %s/%s", antigravityOAuthClientIDEnv, antigravityOAuthClientSecretEnv)
-	}
-	return clientID, clientSecret, nil
 }
 
 func tokenValueFromMetadata(metadata map[string]any) string {

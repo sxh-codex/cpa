@@ -1,6 +1,8 @@
 {
-  "upstream_version": "v7.2.80",
-  "generated_at": "2026-07-19T00:05:42+08:00",
+  "upstream_version": "v7.2.95",
+  "generated_at": "2026-07-23T12:06:07+08:00",
+  "upstream_commit": "f71ec0eb6776854457892452cf28c47f0d658251",
+  "cpamc_panel_source_commit": "3738c0b7ff21ce7e1423795a26769fff05fd81d6",
   "github_sync": {
     "repo": "sxh-codex/cpa",
     "commit": "8375fa3256f3d3cddc804fd4972c3de39a080845",
@@ -19,6 +21,7 @@
     "internal/api/handlers/management/api_tools.go",
     "internal/api/handlers/management/api_tools_test.go",
     "internal/api/handlers/management/auth_files.go",
+    "internal/api/handlers/management/auth_files_agent_identity_test.go",
     "internal/api/handlers/management/auth_files_delete_test.go",
     "internal/api/handlers/management/auth_files_openai_usage_test.go",
     "internal/api/handlers/management/handler.go",
@@ -29,10 +32,17 @@
     "internal/openaiusage/pricing.go",
     "internal/openaiusage/store.go",
     "internal/openaiusage/store_test.go",
+    "internal/runtime/executor/codex_executor.go",
+    "internal/runtime/executor/codex_openai_images.go",
+    "internal/runtime/executor/codex_websockets_executor.go",
+    "internal/runtime/executor/codex_websockets_executor_test.go",
+    "internal/runtime/executor/helps/agent_identity.go",
+    "internal/runtime/executor/helps/agent_identity_test.go",
     "internal/runtime/executor/helps/usage_helpers.go",
     "internal/runtime/executor/helps/usage_helpers_test.go",
     "sdk/api/handlers/openai/openai_responses_websocket.go",
     "sdk/api/handlers/openai/openai_responses_websocket_test.go",
+    "sdk/cliproxy/auth/classification.go",
     "sdk/cliproxy/auth/conductor.go",
     "sdk/cliproxy/auth/conductor_invalid_workspace_test.go",
     "sdk/cliproxy/auth/conductor_scheduler_refresh_test.go",
@@ -44,34 +54,56 @@
     "sdk/cliproxy/usage/manager_test.go",
     "static/management.html"
   ],
+  "cpamc_panel_source_changed_files": [
+    "src/components/quota/QuotaSection.tsx",
+    "src/features/authFiles/components/AuthFileCard.tsx",
+    "src/features/authFiles/constants.ts",
+    "src/features/authFiles/hooks/useAuthFilesData.ts",
+    "src/features/authFiles/uiState.ts",
+    "src/pages/AuthFilesPage.module.scss",
+    "src/pages/AuthFilesPage.tsx",
+    "src/services/api/authFiles.ts"
+  ],
   "patches": [
     {
       "file": "001-backend-local-customizations.patch",
-      "size": 393550,
-      "sha256": "EE96C100714550A09DB6A00548F1092A2F8A5E955A7AEACA5E1794C1D800C58E",
-      "description": "Backend, tests, OpenAI usage accounting, Sub2API pricing, auth status/removal, 429 cooldown, usage manager lifecycle"
+      "size": 471115,
+      "sha256": "BCA711B29B1E54099B124F5C8FA9AEEBE528DD84D8BB5B8128D3F64796112F70",
+      "description": "Backend, tests, OpenAI usage accounting, Sub2API pricing, auth status/removal, 429 cooldown, usage manager lifecycle, sub2api Agent Identity import, AgentAssertion auth, task registration/recovery"
     },
     {
       "file": "002-management-panel-local-ui.patch",
-      "size": 2583146,
-      "sha256": "528959E5747FE0E66BC7D0640EC39F1638FCD52824FE4D08F3A5A3977535C59F",
+      "size": 2586432,
+      "sha256": "2A0A4D0BBCA90D56B1EA746C17E566F1453EE4463AB243DE56CF95400FCA72B5",
       "description": "Restores ignored static/management.html with local panel UI customizations"
+    },
+    {
+      "file": "003-cpamc-panel-source-local-ui.patch",
+      "size": 19096,
+      "sha256": "CE9AB80987B2502F8EF895D89FF13F93210A040DECA2D439C4B9F1DDB688DB6D",
+      "description": "CPAMC source-level local panel UI customizations: page size 100, split 403/401 removal controls, compact OpenAI usage and full-quota display"
     }
   ],
   "validation": {
-    "patch_cached_check": "passed 2026-07-19",
-    "patch_windows_whitespace_check": "passed 2026-07-19 against .codex-sync\\patch-check-v7.2.80-20260717-015109",
-    "targeted_tests": "not rerun during 2026-07-19 record correction; subthread reported targeted api_tools_test.go check passed",
-    "full_tests": "not rerun during 2026-07-19 record correction",
-    "build": "not rebuilt during 2026-07-19 record correction; existing build artifact recorded"
+    "patch_check": "passed 2026-07-23T12:04: git apply --check E:\\CLIProxyAPI\\.codex-local-patches\\001-backend-local-customizations.patch against clean .codex-sync\\patch-check-v7.2.95-20260723",
+    "patch_reverse_check": "passed 2026-07-23 against patched .codex-sync\\official-v7.2.95 for 001 and 002",
+    "cpamc_panel_source_patch_check": "passed 2026-07-23 against latest CPAMC source before application",
+    "cpamc_panel_source_patch_reverse_check": "passed 2026-07-23 against patched E:\\CLIProxyAPI\\.codex-sync\\cpamc-panel-source",
+    "targeted_tests": "passed 2026-07-23T12:01: GOFLAGS=-buildvcs=false GOTOOLCHAIN=local GOMODCACHE=E:\\CLIProxyAPI\\.gomodcache GOPROXY=off go test ./internal/runtime/executor/helps ./internal/api/handlers/management ./internal/runtime/executor ./sdk/cliproxy/auth",
+    "panel_build": "passed 2026-07-22: npm.cmd run build in .codex-sync\\cpamc-panel-source",
+    "build": "passed 2026-07-22: go build -o E:\\CLIProxyAPI\\build-output\\cli-proxy-api.exe ./cmd/server"
   },
   "build_artifact": {
     "path": "E:\\CLIProxyAPI\\build-output\\cli-proxy-api.exe",
-    "version": "v7.2.80",
-    "commit": "unknown",
-    "built_at": "2026-07-18T23:13:55+08:00",
-    "size": 62224384,
-    "sha256": "F58C75DB0694A844442E873C6ABD96750D5E1AA3400B05BB15215E29477A3A27"
+    "generated_this_run": false,
+    "status": "not generated during 2026-07-23T12:06 validation; file was not present when checked"
+  },
+  "panel_artifact": {
+    "path": "E:\\CLIProxyAPI\\static\\management.html",
+    "cpamc_commit": "3738c0b7ff21ce7e1423795a26769fff05fd81d6",
+    "built_at": "2026-07-22T23:51:44+08:00",
+    "size": 2585979,
+    "sha256": "78A9039FCB5054A68E2F35883953AA18D8B593D5E7702C5AC1896349E2AF6A6A"
   },
   "protected_paths_not_modified": [
     "E:\\CLIProxyAPI\\config.yaml",

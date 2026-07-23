@@ -32,6 +32,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/openaiusage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -63,6 +64,7 @@ type codexOAuthService interface {
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
+	authFileEntryMu       sync.Mutex
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
 	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
@@ -338,9 +340,14 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+	nameFilter := strings.TrimSpace(c.Query("name"))
+	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
+		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
+			continue
+		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
@@ -351,6 +358,55 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+func lockedAuthIndex(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return strings.TrimSpace(auth.EnsureIndex())
+}
+
+func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) bool {
+	if auth == nil {
+		return false
+	}
+	if name != "" && strings.TrimSpace(auth.ID) != name && strings.TrimSpace(auth.FileName) != name {
+		return false
+	}
+	if authIndex != "" && lockedAuthIndex(auth) != authIndex {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
+	name = strings.TrimSpace(name)
+	authIndex = strings.TrimSpace(authIndex)
+	if h == nil || h.authManager == nil || name == "" {
+		return nil, false
+	}
+	if authIndex == "" {
+		if auth, ok := h.authManager.GetByID(name); ok {
+			return auth, true
+		}
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth != nil && strings.TrimSpace(auth.FileName) == name {
+				return auth, true
+			}
+		}
+		return nil, false
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if matchesAuthFileLookup(auth, name, authIndex) {
+			return auth, true
+		}
+	}
+	return nil, false
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -403,17 +459,26 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+	nameFilter := strings.TrimSpace(c.Query("name"))
+	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
 	files := make([]gin.H, 0)
+	if authIndexFilter != "" {
+		c.JSON(200, gin.H{"files": files})
+		return
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
+		if nameFilter != "" && name != nameFilter {
+			continue
+		}
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
@@ -466,6 +531,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return h.buildAuthFileEntryLocked(auth)
+}
+
+func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -509,6 +580,18 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
+	}
+	if helps.IsAgentIdentityAuth(auth) {
+		entry["auth_mode"] = helps.OpenAIAuthModeAgentIdentity
+		if workspaceID := authMetadataString(auth, "workspace_id"); workspaceID != "" {
+			entry["workspace_id"] = workspaceID
+		}
+		if planType := authMetadataString(auth, "plan_type"); planType != "" {
+			entry["plan_type"] = planType
+		}
+		if runtimeID := redactedAgentRuntimeID(authMetadataString(auth, "agent_runtime_id")); runtimeID != "" {
+			entry["agent_runtime_id"] = runtimeID
+		}
 	}
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
@@ -589,6 +672,27 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		entry["websockets"] = websockets
 	}
 	return entry
+}
+
+func authMetadataString(auth *coreauth.Auth, key string) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if value, ok := auth.Metadata[key].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func redactedAgentRuntimeID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 10 {
+		return value
+	}
+	return value[:6] + "..." + value[len(value)-4:]
 }
 
 func (h *Handler) openAIUsageForAuth(auth *coreauth.Auth) (openaiusage.AccountStats, bool) {
@@ -864,12 +968,17 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
+		result, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0])
+		if errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
+			return
+		}
+		if result.IsWrapper {
+			c.JSON(http.StatusOK, result.responseBody())
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -879,7 +988,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			result, errUpload := h.storeUploadedAuthFile(ctx, file)
 			if errUpload != nil {
 				failureName := ""
 				if file != nil {
@@ -892,7 +1001,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				failed = append(failed, gin.H{"name": failureName, "error": msg})
 				continue
 			}
-			uploaded = append(uploaded, name)
+			uploaded = append(uploaded, result.Files...)
+			failed = append(failed, result.Failed...)
 		}
 		if len(failed) > 0 {
 			c.JSON(http.StatusMultiStatus, gin.H{
@@ -924,8 +1034,13 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+	result, err := h.writeUploadedAuthData(ctx, filepath.Base(name), data)
+	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if result.IsWrapper {
+		c.JSON(http.StatusOK, result.responseBody())
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -1134,28 +1249,230 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+type uploadedAuthResult struct {
+	IsWrapper bool
+	Uploaded  int
+	Skipped   int
+	Files     []string
+	Failed    []gin.H
+}
+
+func (r uploadedAuthResult) responseBody() gin.H {
+	status := "ok"
+	if len(r.Failed) > 0 || r.Skipped > 0 {
+		status = "partial"
+	}
+	return gin.H{
+		"status":   status,
+		"uploaded": r.Uploaded,
+		"skipped":  r.Skipped,
+		"files":    r.Files,
+		"failed":   r.Failed,
+	}
+}
+
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (uploadedAuthResult, error) {
 	if file == nil {
-		return "", fmt.Errorf("no file uploaded")
+		return uploadedAuthResult{}, fmt.Errorf("no file uploaded")
 	}
 	name := filepath.Base(strings.TrimSpace(file.Filename))
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return "", errAuthFileMustBeJSON
+		return uploadedAuthResult{}, errAuthFileMustBeJSON
 	}
 	src, err := file.Open()
 	if err != nil {
-		return "", fmt.Errorf("failed to open uploaded file: %w", err)
+		return uploadedAuthResult{}, fmt.Errorf("failed to open uploaded file: %w", err)
 	}
 	defer src.Close()
 
 	data, err := io.ReadAll(src)
 	if err != nil {
-		return "", fmt.Errorf("failed to read uploaded file: %w", err)
+		return uploadedAuthResult{}, fmt.Errorf("failed to read uploaded file: %w", err)
+	}
+	return h.writeUploadedAuthData(ctx, name, data)
+}
+
+func (h *Handler) writeUploadedAuthData(ctx context.Context, name string, data []byte) (uploadedAuthResult, error) {
+	if wrapper, ok := parseSub2APIAgentIdentityExport(data); ok {
+		return h.writeSub2APIAgentIdentityExport(ctx, name, wrapper)
 	}
 	if err := h.writeAuthFile(ctx, name, data); err != nil {
-		return "", err
+		return uploadedAuthResult{}, err
 	}
-	return name, nil
+	return uploadedAuthResult{Uploaded: 1, Files: []string{filepath.Base(name)}}, nil
+}
+
+type sub2APIAgentIdentityExport struct {
+	Accounts []sub2APIExportAccount `json:"accounts"`
+}
+
+type sub2APIExportAccount struct {
+	Name        string                  `json:"name"`
+	Platform    string                  `json:"platform"`
+	Type        string                  `json:"type"`
+	Credentials sub2APIAgentCredentials `json:"credentials"`
+}
+
+type sub2APIAgentCredentials struct {
+	AuthMode                     string `json:"auth_mode"`
+	AuthModeCamel                string `json:"authMode"`
+	AgentPrivateKey              string `json:"agent_private_key"`
+	AgentPrivateKeyCamel         string `json:"agentPrivateKey"`
+	AgentRuntimeID               string `json:"agent_runtime_id"`
+	AgentRuntimeIDCamel          string `json:"agentRuntimeId"`
+	TaskID                       string `json:"task_id"`
+	TaskIDCamel                  string `json:"taskId"`
+	WorkspaceID                  string `json:"workspace_id"`
+	WorkspaceIDCamel             string `json:"workspaceId"`
+	Email                        string `json:"email"`
+	AccountID                    string `json:"account_id"`
+	AccountIDCamel               string `json:"accountId"`
+	ChatGPTUserID                string `json:"chatgpt_user_id"`
+	ChatGPTUserIDCamel           string `json:"chatgptUserId"`
+	PlanType                     string `json:"plan_type"`
+	PlanTypeCamel                string `json:"planType"`
+	ChatGPTAccountIsFedRAMP      *bool  `json:"chatgpt_account_is_fedramp"`
+	ChatGPTAccountIsFedRAMPCamel *bool  `json:"chatgptAccountIsFedramp"`
+}
+
+func parseSub2APIAgentIdentityExport(data []byte) (sub2APIAgentIdentityExport, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return sub2APIAgentIdentityExport{}, false
+	}
+	accountsRaw, ok := raw["accounts"]
+	if !ok {
+		return sub2APIAgentIdentityExport{}, false
+	}
+	var wrapper sub2APIAgentIdentityExport
+	if err := json.Unmarshal(accountsRaw, &wrapper.Accounts); err != nil {
+		return sub2APIAgentIdentityExport{}, false
+	}
+	return wrapper, true
+}
+
+func (h *Handler) writeSub2APIAgentIdentityExport(ctx context.Context, originalName string, wrapper sub2APIAgentIdentityExport) (uploadedAuthResult, error) {
+	result := uploadedAuthResult{IsWrapper: true, Files: make([]string, 0, len(wrapper.Accounts)), Failed: make([]gin.H, 0)}
+	for i, account := range wrapper.Accounts {
+		fileName, payload, err := buildSub2APIAgentIdentityAuthFile(originalName, i, account)
+		if err != nil {
+			result.Skipped++
+			result.Failed = append(result.Failed, gin.H{"index": i, "name": account.Name, "error": err.Error()})
+			continue
+		}
+		uniqueName := h.uniqueAuthFileName(fileName)
+		if err := h.writeAuthFile(ctx, uniqueName, payload); err != nil {
+			result.Skipped++
+			result.Failed = append(result.Failed, gin.H{"index": i, "name": account.Name, "error": err.Error()})
+			continue
+		}
+		result.Uploaded++
+		result.Files = append(result.Files, uniqueName)
+	}
+	return result, nil
+}
+
+func buildSub2APIAgentIdentityAuthFile(originalName string, index int, account sub2APIExportAccount) (string, []byte, error) {
+	if !strings.EqualFold(strings.TrimSpace(account.Type), "oauth") {
+		return "", nil, fmt.Errorf("account type is not oauth")
+	}
+	creds := account.Credentials
+	if !strings.EqualFold(sub2APIFirstNonEmpty(creds.AuthMode, creds.AuthModeCamel), helps.OpenAIAuthModeAgentIdentity) {
+		return "", nil, fmt.Errorf("auth_mode is not agentIdentity")
+	}
+	privateKey := sub2APIFirstNonEmpty(creds.AgentPrivateKey, creds.AgentPrivateKeyCamel)
+	if privateKey == "" {
+		return "", nil, fmt.Errorf("agent_private_key is required")
+	}
+	runtimeID := sub2APIFirstNonEmpty(creds.AgentRuntimeID, creds.AgentRuntimeIDCamel)
+	if runtimeID == "" {
+		return "", nil, fmt.Errorf("agent_runtime_id is required")
+	}
+	fedramp := false
+	if creds.ChatGPTAccountIsFedRAMP != nil {
+		fedramp = *creds.ChatGPTAccountIsFedRAMP
+	} else if creds.ChatGPTAccountIsFedRAMPCamel != nil {
+		fedramp = *creds.ChatGPTAccountIsFedRAMPCamel
+	}
+	metadata := map[string]any{
+		"type":                       "codex",
+		"auth_kind":                  "oauth",
+		"auth_mode":                  helps.OpenAIAuthModeAgentIdentity,
+		"email":                      strings.TrimSpace(creds.Email),
+		"agent_runtime_id":           runtimeID,
+		"agent_private_key":          privateKey,
+		"task_id":                    sub2APIFirstNonEmpty(creds.TaskID, creds.TaskIDCamel),
+		"workspace_id":               sub2APIFirstNonEmpty(creds.WorkspaceID, creds.WorkspaceIDCamel),
+		"account_id":                 sub2APIFirstNonEmpty(creds.AccountID, creds.AccountIDCamel),
+		"chatgpt_user_id":            sub2APIFirstNonEmpty(creds.ChatGPTUserID, creds.ChatGPTUserIDCamel),
+		"plan_type":                  sub2APIFirstNonEmpty(creds.PlanType, creds.PlanTypeCamel),
+		"chatgpt_account_is_fedramp": fedramp,
+	}
+	payload, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to serialize agent identity auth file")
+	}
+	return sub2APIAgentIdentityFileName(originalName, index, metadata), payload, nil
+}
+
+func sub2APIAgentIdentityFileName(originalName string, index int, metadata map[string]any) string {
+	seedParts := []string{
+		fmt.Sprintf("%d", index),
+		strings.TrimSpace(fmt.Sprint(metadata["email"])),
+		strings.TrimSpace(fmt.Sprint(metadata["workspace_id"])),
+		strings.TrimSpace(fmt.Sprint(metadata["agent_runtime_id"])),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(seedParts, "|")))
+	prefix := sanitizeAuthFileNamePart(strings.TrimSuffix(filepath.Base(originalName), filepath.Ext(originalName)))
+	if prefix == "" {
+		prefix = "sub2api-agent"
+	}
+	return fmt.Sprintf("%s-agentIdentity-%s.json", prefix, hex.EncodeToString(sum[:])[:12])
+}
+
+func sanitizeAuthFileNamePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		case r == '.' || r == ' ':
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-_")
+}
+
+func sub2APIFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func (h *Handler) uniqueAuthFileName(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	if base == "" {
+		base = "sub2api-agentIdentity.json"
+	}
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if ext == "" {
+		ext = ".json"
+	}
+	candidate := base
+	for i := 1; ; i++ {
+		path := filepath.Join(h.cfg.AuthDir, candidate)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+	}
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
@@ -1457,8 +1774,9 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string `json:"name"`
-		Disabled *bool  `json:"disabled"`
+		Name      string `json:"name"`
+		AuthIndex string `json:"auth_index"`
+		Disabled  *bool  `json:"disabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1466,6 +1784,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	name := strings.TrimSpace(req.Name)
+	authIndex := strings.TrimSpace(req.AuthIndex)
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
@@ -1477,20 +1796,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth, _ := h.lookupAuthFile(name, authIndex)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return

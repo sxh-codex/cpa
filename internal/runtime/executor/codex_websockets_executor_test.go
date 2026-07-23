@@ -3,6 +3,10 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -37,6 +42,138 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func TestBuildCodexWebsocketRequestBodySanitizesOverlongInputItemIDs(t *testing.T) {
+	longReasoningItemID := "rs_" + strings.Repeat("a", 64)
+	longCallItemID := strings.Repeat("grok-call-item-", 6)
+	longOutputItemID := strings.Repeat("grok-output-item-", 6)
+	body := []byte(`{"model":"gpt-5-codex","input":[{"type":"reasoning","id":"` + longReasoningItemID + `","encrypted_content":"gAAAA-encrypted","summary":[]},{"type":"function_call","id":"` + longCallItemID + `","call_id":"call-1","name":"lookup"},{"type":"function_call_output","id":"` + longOutputItemID + `","call_id":"call-1","output":"ok"},{"type":"message","id":"msg-1"}]}`)
+
+	first := buildCodexWebsocketRequestBody(body)
+	second := buildCodexWebsocketRequestBody(body)
+
+	if input := gjson.GetBytes(first, "input").Array(); len(input) != 3 {
+		t.Fatalf("input length = %d, want 3: %s", len(input), first)
+	}
+	if gotType := gjson.GetBytes(first, "input.0.type").String(); gotType != "function_call" {
+		t.Fatalf("input.0.type = %q, want function_call: %s", gotType, first)
+	}
+
+	shortCallItemID := gjson.GetBytes(first, "input.0.id").String()
+	shortOutputItemID := gjson.GetBytes(first, "input.1.id").String()
+	if len([]rune(shortCallItemID)) > 64 || shortCallItemID == longCallItemID {
+		t.Fatalf("input.0.id was not shortened to at most 64 characters: %q", shortCallItemID)
+	}
+	if len([]rune(shortOutputItemID)) > 64 || shortOutputItemID == longOutputItemID {
+		t.Fatalf("input.1.id was not shortened to at most 64 characters: %q", shortOutputItemID)
+	}
+	if shortCallItemID == shortOutputItemID {
+		t.Fatalf("distinct long IDs produced the same shortened ID: %q", shortCallItemID)
+	}
+	if got := gjson.GetBytes(second, "input.0.id").String(); got != shortCallItemID {
+		t.Fatalf("input item ID shortening is not deterministic: first=%q second=%q", shortCallItemID, got)
+	}
+	if got := gjson.GetBytes(first, "input.0.call_id").String(); got != "call-1" {
+		t.Fatalf("function call_id = %q, want call-1", got)
+	}
+	if got := gjson.GetBytes(first, "input.1.call_id").String(); got != "call-1" {
+		t.Fatalf("function call output call_id = %q, want call-1", got)
+	}
+	if got := gjson.GetBytes(first, "input.2.id").String(); got != "msg-1" {
+		t.Fatalf("valid input item ID changed: %q", got)
+	}
+}
+
+func TestCodexWebsocketsExecuteRestoresClaudeAgentReasoningReplay(t *testing.T) {
+	internalcache.ClearCodexReasoningReplayCache()
+	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
+
+	encryptedContent := validCodexReasoningEncryptedContentForTestSeed(31)
+	cacheCodexReasoningReplayFromCompleted(codexReasoningReplayScope{
+		modelName:  "gpt-5.4",
+		sessionKey: "claude:ws-replay-session:agent:agent-a",
+	}, []byte(`{"response":{"output":[`+
+		`{"type":"reasoning","summary":[],"content":null,"encrypted_content":"`+encryptedContent+`"},`+
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"previous answer"}]}`+
+		`]}}`))
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Fatalf("upgrade websocket: %v", errUpgrade)
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Fatalf("read upstream websocket message: %v", errRead)
+		}
+		capturedPayload <- bytes.Clone(payload)
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws-replay","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"next answer"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"messages":[
+				{"role":"user","content":"first"},
+				{"role":"assistant","content":"previous answer"},
+				{"role":"user","content":"next"}
+			]
+		}`),
+	}
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", "ws-replay-session")
+	headers.Set("X-Claude-Code-Agent-Id", "agent-a")
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Headers: headers}
+
+	if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		input := gjson.GetBytes(payload, "input").Array()
+		if len(input) != 4 {
+			t.Fatalf("upstream input length = %d, want 4; payload=%s", len(input), payload)
+		}
+		if input[1].Get("type").String() != "reasoning" || input[1].Get("encrypted_content").String() != encryptedContent {
+			t.Fatalf("websocket reasoning replay missing before assistant message: %s", payload)
+		}
+		if input[2].Get("role").String() != "assistant" {
+			t.Fatalf("input.2.role = %q, want assistant; payload=%s", input[2].Get("role").String(), payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestClearCodexReasoningReplayOnWebsocketInvalidSignature(t *testing.T) {
+	internalcache.ClearCodexReasoningReplayCache()
+	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
+
+	scope := codexReasoningReplayScope{modelName: "gpt-5.4", sessionKey: "claude:ws-invalid:agent:main"}
+	encryptedContent := validCodexReasoningEncryptedContentForTestSeed(32)
+	if !internalcache.CacheCodexReasoningReplayItem(scope.modelName, scope.sessionKey, []byte(`{"type":"reasoning","summary":[],"content":null,"encrypted_content":"`+encryptedContent+`"}`)) {
+		t.Fatal("failed to seed websocket replay cache")
+	}
+	payload := []byte(`{"type":"error","status":400,"body":{"error":{"message":"Invalid signature in thinking block","type":"invalid_request_error","code":"invalid_request_error"}}}`)
+	if errClear := clearCodexReasoningReplayOnWebsocketError(context.Background(), scope, payload); errClear != nil {
+		t.Fatalf("clear websocket replay error: %v", errClear)
+	}
+	if _, ok := internalcache.GetCodexReasoningReplayItem(scope.modelName, scope.sessionKey); ok {
+		t.Fatal("websocket invalid signature did not clear replay state")
 	}
 }
 
@@ -74,7 +211,7 @@ func TestCodexWebsocketsExecuteResponsesLiteDoesNotInjectImageGenerationTool(t *
 	}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",
-		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},{"role":"user","content":"hello"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`),
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},{"role":"user","content":"hello"}],"parallel_tool_calls":true,"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
@@ -92,6 +229,81 @@ func TestCodexWebsocketsExecuteResponsesLiteDoesNotInjectImageGenerationTool(t *
 		}
 		if got := gjson.GetBytes(payload, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String(); got != "true" {
 			t.Fatalf("responses-lite metadata = %q, want true; payload=%s", got, payload)
+		}
+		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
+			t.Fatalf("responses-lite parallel_tool_calls should be false: %s", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamResponsesLiteForcesParallelToolCallsFalse(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		capturedPayload <- bytes.Clone(payload)
+
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Errorf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":   "sk-test",
+			"base_url":  server.URL,
+			"plan_type": "pro",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-luna",
+		Payload: []byte(`{"model":"gpt-5.6-luna","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},{"role":"user","content":"hello"}],"parallel_tool_calls":true,"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	streamComplete := false
+	for !streamComplete {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				streamComplete = true
+				continue
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error = %v", chunk.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for websocket stream completion")
+		}
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
+			t.Fatalf("responses-lite parallel_tool_calls should be false: %s", payload)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
@@ -186,7 +398,7 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"prolite/gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		Payload: []byte(`{"model":"prolite/gpt-5-codex","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},{"type":"message","role":"user","content":"hello"}],"parallel_tool_calls":true}`),
 	}
 	opts := cliproxyexecutor.Options{
 		SourceFormat:   sdktranslator.FromString("openai-response"),
@@ -218,6 +430,10 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 	case payload := <-capturedPayload:
 		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5-codex" {
 			t.Fatalf("upstream model = %s, want gpt-5-codex; payload=%s", got, payload)
+		}
+		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		if !parallelToolCalls.Exists() || !parallelToolCalls.Bool() {
+			t.Fatalf("non-lite parallel_tool_calls should be preserved: %s", payload)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
@@ -286,6 +502,173 @@ func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsock
 	}
 }
 
+func TestSendTerminalWebsocketReadInvalidatesBeforeWaitingForCapacity(t *testing.T) {
+	terminalErr := &websocket.CloseError{Code: websocket.CloseMessageTooBig}
+
+	t.Run("available channel keeps fast path ordering", func(t *testing.T) {
+		ch := make(chan codexWebsocketRead, 1)
+		done := make(chan struct{})
+		invalidateCalls := 0
+		invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{err: terminalErr}, func() {
+			invalidateCalls++
+		})
+		if invalidated {
+			t.Fatal("available channel should not invalidate before delivery")
+		}
+		if invalidateCalls != 0 {
+			t.Fatalf("invalidate calls = %d, want 0", invalidateCalls)
+		}
+		event := <-ch
+		if !errors.Is(event.err, terminalErr) {
+			t.Fatalf("terminal error = %v, want %v", event.err, terminalErr)
+		}
+	})
+
+	t.Run("full channel invalidates before waiting", func(t *testing.T) {
+		ch := make(chan codexWebsocketRead, 1)
+		ch <- codexWebsocketRead{payload: []byte("queued")}
+		done := make(chan struct{})
+		invalidateCalled := make(chan struct{})
+		result := make(chan bool, 1)
+
+		go func() {
+			result <- sendTerminalWebsocketRead(ch, done, codexWebsocketRead{err: terminalErr}, func() {
+				close(invalidateCalled)
+			})
+		}()
+
+		select {
+		case <-invalidateCalled:
+		case <-time.After(time.Second):
+			t.Fatal("invalidation did not happen before waiting for channel capacity")
+		}
+		select {
+		case <-result:
+			t.Fatal("terminal sender returned before capacity was released")
+		default:
+		}
+
+		<-ch
+		select {
+		case event := <-ch:
+			if !errors.Is(event.err, terminalErr) {
+				t.Fatalf("terminal error = %v, want %v", event.err, terminalErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for terminal read")
+		}
+		select {
+		case invalidated := <-result:
+			if !invalidated {
+				t.Fatal("full channel should report early invalidation")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("terminal sender did not finish")
+		}
+	})
+
+	t.Run("full channel stops when invalidation cancels active read", func(t *testing.T) {
+		ch := make(chan codexWebsocketRead, 1)
+		ch <- codexWebsocketRead{payload: []byte("queued")}
+		done := make(chan struct{})
+		invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{err: terminalErr}, func() {
+			close(done)
+		})
+		if !invalidated {
+			t.Fatal("full channel should report early invalidation")
+		}
+		if len(ch) != 1 {
+			t.Fatalf("channel length = %d, want queued payload only", len(ch))
+		}
+	})
+}
+
+func TestMapCodexWebsocketWriteErrorStopsRetryForMessageTooBig(t *testing.T) {
+	networkWriteErr := errors.New("write: broken pipe")
+	tests := []struct {
+		name       string
+		closeCode  int
+		writeErr   error
+		wantStatus int
+		wantRetry  bool
+	}{
+		{
+			name:       "close sent after message too big is request scoped",
+			closeCode:  websocket.CloseMessageTooBig,
+			writeErr:   websocket.ErrCloseSent,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantRetry:  false,
+		},
+		{
+			name:       "network write error after message too big is request scoped",
+			closeCode:  websocket.CloseMessageTooBig,
+			writeErr:   networkWriteErr,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantRetry:  false,
+		},
+		{
+			name:      "other close keeps stale connection retry",
+			closeCode: websocket.CloseNormalClosure,
+			writeErr:  websocket.ErrCloseSent,
+			wantRetry: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &codexWebsocketSession{}
+			conn := &websocket.Conn{}
+			sess.resetUpstreamDisconnectError(conn)
+			sess.setUpstreamDisconnectError(conn, &websocket.CloseError{Code: tt.closeCode})
+
+			mappedErr := mapCodexWebsocketWriteError(sess, conn, tt.writeErr)
+			if got := shouldRetryCodexWebsocketSend(mappedErr); got != tt.wantRetry {
+				t.Fatalf("shouldRetryCodexWebsocketSend() = %v, want %v; err=%v", got, tt.wantRetry, mappedErr)
+			}
+			if tt.wantStatus == 0 {
+				if !errors.Is(mappedErr, tt.writeErr) {
+					t.Fatalf("mapped error = %v, want %v", mappedErr, tt.writeErr)
+				}
+				return
+			}
+			statusErr, ok := mappedErr.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != tt.wantStatus {
+				t.Fatalf("mapped status = %v, want %d; err=%v", statusErr, tt.wantStatus, mappedErr)
+			}
+			requestErr, ok := mappedErr.(interface{ IsRequestScoped() bool })
+			if !ok || !requestErr.IsRequestScoped() {
+				t.Fatalf("mapped error should be request scoped, got %T", mappedErr)
+			}
+		})
+	}
+}
+
+func TestMapCodexWebsocketWriteErrorDoesNotReusePriorConnectionClose(t *testing.T) {
+	sess := &codexWebsocketSession{}
+	priorConn := &websocket.Conn{}
+	replacementConn := &websocket.Conn{}
+
+	sess.resetUpstreamDisconnectError(priorConn)
+	sess.setUpstreamDisconnectError(priorConn, &websocket.CloseError{Code: websocket.CloseMessageTooBig})
+	priorErr := mapCodexWebsocketWriteError(sess, priorConn, websocket.ErrCloseSent)
+	if shouldRetryCodexWebsocketSend(priorErr) {
+		t.Fatalf("prior connection 1009 should not retry, got %v", priorErr)
+	}
+
+	sess.resetUpstreamDisconnectError(replacementConn)
+	// A late close callback from the prior connection must not overwrite the
+	// replacement connection's close state.
+	sess.setUpstreamDisconnectError(priorConn, &websocket.CloseError{Code: websocket.CloseMessageTooBig})
+	sess.setUpstreamDisconnectError(replacementConn, &websocket.CloseError{Code: websocket.CloseNormalClosure})
+	replacementErr := mapCodexWebsocketWriteError(sess, replacementConn, websocket.ErrCloseSent)
+	if !errors.Is(replacementErr, websocket.ErrCloseSent) {
+		t.Fatalf("replacement connection error = %v, want %v", replacementErr, websocket.ErrCloseSent)
+	}
+	if !shouldRetryCodexWebsocketSend(replacementErr) {
+		t.Fatalf("replacement connection should keep stale-connection retry, got %v", replacementErr)
+	}
+}
+
 func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -343,6 +726,10 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
 			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
 		}
+		requestErr, ok := chunk.Err.(interface{ IsRequestScoped() bool })
+		if !ok || !requestErr.IsRequestScoped() {
+			t.Fatalf("message-too-big error should be request scoped, got %T", chunk.Err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error stream chunk")
 	}
@@ -373,6 +760,7 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	defer func() { _ = conn.Close() }()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	sessionID := "sess-1"
 	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
 	if disconnectCh == nil {
@@ -407,7 +795,7 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 }
 
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
+	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, nil, "", nil)
 
 	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
 		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
@@ -441,6 +829,105 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
+func TestApplyCodexWebsocketHeadersAgentIdentityUsesAgentAssertion(t *testing.T) {
+	encodedPrivateKey := testCodexWebsocketAgentIdentityPrivateKey(t)
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"auth_mode":         "agentIdentity",
+			"agent_runtime_id":  "runtime-test",
+			"agent_private_key": encodedPrivateKey,
+			"task_id":           "task-test",
+		},
+	}
+
+	headers, err := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "bearer-token-should-not-be-used", nil)
+	if err != nil {
+		t.Fatalf("applyCodexWebsocketHeaders: %v", err)
+	}
+	authorization := headers.Get("Authorization")
+	if !strings.HasPrefix(authorization, "AgentAssertion ") {
+		t.Fatalf("Authorization prefix mismatch")
+	}
+	if authorization == "Bearer bearer-token-should-not-be-used" {
+		t.Fatal("Authorization used Bearer token for Agent Identity")
+	}
+	if strings.Contains(authorization, encodedPrivateKey) {
+		t.Fatal("Authorization contains private key")
+	}
+	if strings.Contains(authorization, "bearer-token-should-not-be-used") {
+		t.Fatal("Authorization contains fallback bearer token")
+	}
+}
+
+func TestApplyCodexWebsocketHeadersAgentIdentityMissingCredentialReturnsError(t *testing.T) {
+	encodedPrivateKey := testCodexWebsocketAgentIdentityPrivateKey(t)
+	tests := []struct {
+		name     string
+		metadata map[string]any
+	}{
+		{
+			name: "missing agent_private_key",
+			metadata: map[string]any{
+				"auth_mode":        "agentIdentity",
+				"agent_runtime_id": "runtime-test",
+				"task_id":          "task-test",
+			},
+		},
+		{
+			name: "missing agent_runtime_id",
+			metadata: map[string]any{
+				"auth_mode":         "agentIdentity",
+				"agent_private_key": encodedPrivateKey,
+				"task_id":           "task-test",
+			},
+		},
+		{
+			name: "missing task_id",
+			metadata: map[string]any{
+				"auth_mode":         "agentIdentity",
+				"agent_runtime_id":  "runtime-test",
+				"agent_private_key": encodedPrivateKey,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{Provider: "codex", Metadata: tt.metadata}
+			headers, err := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "bearer-token-should-not-be-used", nil)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if headers != nil && headers.Get("Authorization") != "" {
+				t.Fatalf("Authorization = %q, want empty on error", headers.Get("Authorization"))
+			}
+		})
+	}
+}
+
+func testCodexWebsocketAgentIdentityPrivateKey(t *testing.T) string {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(der)
+}
+
+func mustApplyCodexWebsocketHeaders(t *testing.T, ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
+	t.Helper()
+	applied, err := applyCodexWebsocketHeaders(ctx, headers, auth, token, cfg)
+	if err != nil {
+		t.Fatalf("applyCodexWebsocketHeaders: %v", err)
+	}
+	return applied
+}
+
 func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
@@ -455,7 +942,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 		"session-id":            "legacy-session",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", nil)
 
 	if got := headers.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
@@ -491,7 +978,7 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 		"Session_id": "legacy-underscore-session",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", nil)
 
 	if got := headers["session_id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
 		t.Fatalf("session_id = %#v, want [legacy-underscore-session]", got)
@@ -513,7 +1000,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
+	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "", cfg)
 
 	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
 		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
@@ -545,7 +1032,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 	headers.Set("User-Agent", "existing-ua")
 	headers.Set("X-Codex-Beta-Features", "existing-beta")
 
-	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
+	got := mustApplyCodexWebsocketHeaders(t, ctx, headers, auth, "", cfg)
 
 	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
 		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
@@ -571,7 +1058,7 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 		"X-Codex-Beta-Features": "client-beta",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
+	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "", cfg)
 
 	if got := headers.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
@@ -593,7 +1080,7 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 		Attributes: map[string]string{"api_key": "sk-test"},
 	}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg)
+	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "sk-test", cfg)
 
 	if got := headers.Get("User-Agent"); got != "" {
 		t.Fatalf("User-Agent = %s, want empty", got)
@@ -610,7 +1097,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
 	ctx := contextWithGinHeaders(map[string]string{"User-Agent": "api-key-client/1.0", "Originator": "explicit-origin"})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "sk-test", nil)
+	headers := mustApplyCodexWebsocketHeaders(t, ctx, http.Header{}, auth, "sk-test", nil)
 
 	if got := headers.Get("User-Agent"); got != "api-key-client/1.0" {
 		t.Fatalf("User-Agent = %s, want api-key-client/1.0", got)
@@ -623,7 +1110,7 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"account_id": "acct-1"}}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", nil)
+	headers := mustApplyCodexWebsocketHeaders(t, context.Background(), http.Header{}, auth, "", nil)
 
 	if got := headerValueCaseInsensitive(headers, "ChatGPT-Account-ID"); got != "acct-1" {
 		t.Fatalf("ChatGPT-Account-ID = %s, want acct-1", got)
@@ -727,7 +1214,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
 		"X-Client-Request-Id":   "client-request-1",
 	})
-	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
+	headers = mustApplyCodexWebsocketHeaders(t, ctx, headers, auth, "oauth-token", cfg)
 	applyCodexIdentityConfuseHeaders(headers, &identityState)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
@@ -918,7 +1405,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 		"User-Agent": "client-ua",
 	}))
 
-	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+	_ = applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
 	if got := req.Header.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
@@ -944,7 +1431,7 @@ func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 
-	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+	_ = applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna")
 
 	if got := req.Header.Get("User-Agent"); got != wantUA {
@@ -1009,7 +1496,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 	}))
 
-	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+	_ = applyCodexHeaders(req, auth, "oauth-token", true, nil)
 
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
@@ -1031,7 +1518,7 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 
-	applyCodexHeaders(req, nil, "oauth-token", true, nil)
+	_ = applyCodexHeaders(req, nil, "oauth-token", true, nil)
 
 	if got := req.Header.Get("Version"); got != "" {
 		t.Fatalf("Version = %q, want empty", got)
